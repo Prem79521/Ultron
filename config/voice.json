@@ -1,0 +1,6 @@
+{
+    "provider": "pyttsx3",
+    "rate": 165,
+    "volume": 1.0,
+    "voice_gender": "male"
+}

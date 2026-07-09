@@ -1,0 +1,10 @@
+{
+    "app_name": "ULTRON",
+    "version": "1.0.0",
+    "environment": "development",
+    "user": {
+        "display_name": "Prem"
+    },
+    "projects_directory": "c:\\Users\\craft\\Desktop\\Ultron",
+    "editor_command": "code"
+}

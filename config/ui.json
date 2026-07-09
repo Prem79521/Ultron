@@ -1,0 +1,16 @@
+{
+    "window": {
+        "title": "ULTRON Cognitive OS",
+        "width": 1024,
+        "height": 640,
+        "frameless": true,
+        "opacity": 0.98
+    },
+    "theme": {
+        "active_theme": "matte_black_scarlet"
+    },
+    "animations": {
+        "enabled": true,
+        "duration_ms": 300
+    }
+}

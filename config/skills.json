@@ -1,0 +1,8 @@
+{
+    "plugin_directories": [
+        "c:\\Users\\craft\\Desktop\\Ultron\\plugins"
+    ],
+    "terminal": {
+        "preferred_shell": "powershell"
+    }
+}

@@ -1,0 +1,7 @@
+<GRAMMAR LANGID="809">
+    <RULE NAME="WakeRule" TOPLEVEL="ACTIVE">
+        <L>
+            <P>Arise</P>
+        </L>
+    </RULE>
+</GRAMMAR>

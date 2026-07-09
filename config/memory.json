@@ -1,0 +1,4 @@
+{
+    "db_path": "ultron_memory.db",
+    "backup_enabled": false
+}

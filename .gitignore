@@ -174,3 +174,11 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# ULTRON custom ignores
+ultron_memory.db*
+ultron.log
+logs/
+models/
+node_modules/
+.gemini/
