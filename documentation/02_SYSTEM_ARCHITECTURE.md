@@ -17,6 +17,7 @@ graph TD
     HL[Hardware Abstraction Layer]
     SR[Skill Registry]
     DB[(SQLite Storage)]
+    MS[McpService / MCP Server]
     
     UI -->|Sends Text Command| AC
     UI -->|Subscribes to| EB
@@ -28,7 +29,10 @@ graph TD
     SM -->|Publishes STATE_CHANGED| EB
     SV -->|Manages Lifecycles| WE
     SV -->|Manages Lifecycles| HL
+    SV -->|Manages Lifecycles| MS
     HM -->|Watchdog Audit| SV
+    MS <-->|Publishes & Subscribes| EB
+    MS <-->|Read-only query| DB
 ```
 
 ---
@@ -39,6 +43,11 @@ graph TD
 - **File**: `ultron/core/boot_manager.py`
 - **Responsibility**: Coordinates Power-On Self-Test (POST) steps at system startup, sequentially validating all 12 core layers and reporting percent completion.
 - **Connection**: Relies on `MemoryManager`, `SkillRegistry`, and config file system.
+
+### MCP Service
+- **File**: `mcp/service.py`
+- **Responsibility**: First-class service hosting the modular Model Context Protocol (MCP) server asynchronously. Exposes tools for filesystem browsing, symbol parsing, git operations, documentation access, and UME memory CRUD.
+- **Connection**: Managed by `ServiceManager`. Subscribes to system state transitions and publishes client directives on the `Event Bus`. Exposes SQLite tables and config logs as read-only resources.
 
 ### State Manager
 - **File**: `ultron/core/state_manager.py`
@@ -58,12 +67,12 @@ graph TD
 ### Event Bus
 - **File**: `ultron/core/event_bus.py`
 - **Responsibility**: High-performance, in-memory publisher-subscriber hub that allows complete decoupling of OS modules.
-- **Connection**: Used by all managers, UI animations, and diagnostics.
+- **Connection**: Used by all managers, UI animations, diagnostics, and the MCP Service.
 
 ### Service Manager
 - **File**: `ultron/core/service_manager.py`
 - **Responsibility**: Governs the startup, shutdown, registry, and hot-reload of background loops.
-- **Connection**: Manages `WakeService`, `SpeechService`, and `VoiceRecognitionService`.
+- **Connection**: Manages `WakeService`, `SpeechService`, `VoiceRecognitionService`, and `McpService`.
 
 ### Health Monitor
 - **File**: `ultron/core/health_monitor.py`
