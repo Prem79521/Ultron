@@ -28,7 +28,19 @@ class WakeDetectorService(UltronService):
         if self.engine_service and self.engine_service.active_wake:
             self.engine_service.active_wake.set_callback(self._on_wake_detected)
             self.engine_service.active_wake.start()
-            
+
+        # Startup banner — requirement 4/9
+        wake_phrase = self.engine_service.wake_phrase if self.engine_service else "ultron"
+        wake_provider = type(self.engine_service.active_wake).__name__ if (
+            self.engine_service and self.engine_service.active_wake
+        ) else "Unknown"
+        self.logger.info(
+            f"Recognition: ACTIVE\n"
+            f"Wake Phrase: {wake_phrase}\n"
+            f"Wake Provider: {wake_provider}\n"
+            f"Listening: READY"
+        )
+
         return True
 
     def stop(self) -> bool:
@@ -45,11 +57,16 @@ class WakeDetectorService(UltronService):
         return "Offline"
 
     def _on_speech_recognized(self, event):
+        import threading, datetime
+        print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] HOP2: WakeDetector._on_speech_recognized | obj={id(self)} | active={self.active}")
         if not self.active:
+            print(f"[PIPELINE] BLOCKED: WakeDetector not active")
             return
-            
+
+        state_now = state_manager.state
+        print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] state_manager.state='{state_now}'")
         # Only evaluate wake words while Sleeping
-        if state_manager.state == "Sleeping":
+        if state_now == "Sleeping":
             text = event.payload.get("text", "")
             confidence = event.payload.get("confidence", 1.0)
             
@@ -65,7 +82,13 @@ class WakeDetectorService(UltronService):
                 return " ".join(t.split())
 
             normalized_text = clean_text(text)
-            wake_phrases = [clean_text(p) for p in self.engine_service.wake_phrase.split(",") if p.strip()] if self.engine_service else ["arise"]
+            wake_phrases = [clean_text(p) for p in self.engine_service.wake_phrase.split(",") if p.strip()] if self.engine_service else ["ultron"]
+
+            # Verbose diagnostics — requirement 5
+            self.logger.info(
+                f"Wake Detector checking:\n\"{text}\"\n"
+                f"against configured phrases:\n{wake_phrases}"
+            )
             
             matched = False
             similarity = 0.0

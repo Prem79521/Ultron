@@ -9,7 +9,7 @@ class TestForensicsPipeline(unittest.TestCase):
         trace_pipeline("Microphone", "Test Device")
         trace_pipeline("Audio Buffer", "1024 bytes")
         trace_pipeline("Recognition Provider", "Test Vosk")
-        trace_pipeline("Recognized Text", "arise")
+        trace_pipeline("Recognized Text", "ultron")
         trace_pipeline("Wake Detector", "Checking")
         trace_pipeline("Wake Match", "Matched")
         trace_pipeline("VoiceSessionManager", "Transitioning")
@@ -22,7 +22,7 @@ class TestForensicsPipeline(unittest.TestCase):
     def test_sapi_wake_provider_cleaning(self):
         # Verify normalization cleans text as specified
         provider = SapiWakeProvider()
-        provider.set_wake_phrase("arise")
+        provider.set_wake_phrase("ultron")
         
         # Mock callback
         matched = False
@@ -34,7 +34,7 @@ class TestForensicsPipeline(unittest.TestCase):
         provider.start()
         
         # Test case: different cases, punctuation, and extra whitespace
-        provider.process_speech("  ,  Arise!  ", 1.0)
+        provider.process_speech("  ,  Ultron!  ", 1.0)
         self.assertTrue(matched)
 
 if __name__ == "__main__":

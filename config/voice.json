@@ -2,5 +2,15 @@
     "provider": "pyttsx3",
     "rate": 165,
     "volume": 1.0,
-    "voice_gender": "male"
+    "voice_gender": "male",
+    "recognizer": "vosk",
+    "wake": "sapi_wake",
+    "wake_phrase": "ultron",
+    "vosk_models_dir": "models",
+    "vosk_preferred_models": [
+        "vosk-model-small-en-us-0.15",
+        "vosk-model-en-us-0.42-gigaspeech",
+        "vosk-model-en-us-0.22"
+    ],
+    "tts": "future"
 }

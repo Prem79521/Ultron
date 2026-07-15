@@ -139,11 +139,14 @@ class VoiceEngineService(UltronService):
         self.reco_provider_name = config_loader.get("voice", "recognizer", "sapi")
         self.wake_provider_name = config_loader.get("voice", "wake", "sapi_wake")
         self.tts_provider_name = config_loader.get("voice", "tts", "pyttsx3")
-        self.wake_phrase = config_loader.get("voice", "wake_phrase", "arise")
+        self.wake_phrase = config_loader.get("voice", "wake_phrase", "ultron")
         
         self.active_recognizer = None
         self.active_wake = None
         self.active_tts = None
+
+        # Initialization state machine (updated by background VoskThread)
+        self.init_state = "UNINITIALIZED"  # UNINITIALIZED|LOADING_MODEL|OPENING_MICROPHONE|STARTING_RECOGNITION|READY|ERROR
         
         self.diagnostics = {
             "current_microphone": "Microphone (GENERAL WEBCAM)",
@@ -192,13 +195,17 @@ class VoiceEngineService(UltronService):
         if self.active_recognizer:
             if hasattr(self.active_recognizer, "device"):
                 self.active_recognizer.device = preferred_idx
-            self.active_recognizer.start()
+            self.active_recognizer.start()  # returns immediately; model loads in VoskThread
+            self.init_state = "STARTING_RECOGNITION"
         if self.active_wake:
             self.active_wake.start()
         if self.active_tts:
             self.active_tts.start()
             
         self.publish_diagnostics()
+        self.logger.info(
+            f"Configured Wake Phrase:\n{self.wake_phrase}"
+        )
         return True
 
     def stop(self) -> bool:
@@ -443,7 +450,7 @@ class VoiceEngineService(UltronService):
         # Audio chunks and latency
         audio_chunks = 0
         latency = 0.0
-        model_name = "vosk-model-en-us-0.42-gigaspeech" # Default
+        model_name = "(resolving\u2026)"  # updated from recognizer once model loads
         
         dropped_buffers = 0
         if self.active_recognizer:
@@ -462,8 +469,9 @@ class VoiceEngineService(UltronService):
         self.diagnostics["model"] = model_name
         
         # Thread status checks
-        self.diagnostics["voice_thread"] = "Running" if (self.active_recognizer and self.active_recognizer.health() == "Running") else "Offline"
+        self.diagnostics["voice_thread"] = "Running" if (self.active_recognizer and self.active_recognizer.health() == "Running") else self.active_recognizer.health() if self.active_recognizer else "Offline"
         self.diagnostics["wake_thread"] = "Running" if (self.active_wake and self.active_wake.health() == "Running") else "Offline"
+        self.diagnostics["init_state"] = self.init_state
         
         # Dynamically query other services and status fields (Phase 5.3)
         try:

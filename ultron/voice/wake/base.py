@@ -6,7 +6,7 @@ class WakeWordProvider(UltronService):
     def __init__(self, name: str = "WakeWordProvider"):
         super().__init__(name)
         self.callback = None
-        self.wake_phrase = "arise"
+        self.wake_phrase = "ultron"
 
     def initialize(self) -> bool:
         """Initializes the wake word detection engine."""

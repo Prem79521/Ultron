@@ -1,0 +1,13 @@
+{
+  "server": {
+    "name": "ULTRON-Cognitive-OS",
+    "port": 8000,
+    "host": "127.0.0.1",
+    "log_level": "WARNING"
+  },
+  "security": {
+    "enable_path_traversal_checks": true,
+    "sanitize_environment_secrets": true,
+    "readonly_database": true
+  }
+}

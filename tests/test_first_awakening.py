@@ -80,11 +80,11 @@ class TestFirstAwakening(unittest.TestCase):
         class MockEngineService:
             def __init__(self):
                 self.active_wake = SapiWakeProvider()
-                self.active_wake.set_wake_phrase("arise")
+                self.active_wake.set_wake_phrase("ultron")
                 self.active_wake.start()
                 self.active_recognizer = MockRecognizer()
                 self.reco_provider_name = "mock_reco"
-                self.wake_phrase = "arise"
+                self.wake_phrase = "ultron"
                 self.diagnostics = {
                     "wake_matches": 0,
                     "last_wake_event": 0,
@@ -119,19 +119,19 @@ class TestFirstAwakening(unittest.TestCase):
                 pass
 
     def test_end_to_end_awakening_pipeline(self):
-        """Validates: Speech Recognized(Arise) -> Wake -> State(Listening) -> Speech(Launch notepad)."""
-        # Step 1: Simulate user saying "Arise"
+        """Validates: Speech Recognized(Ultron) -> Wake -> State(Listening) -> Speech(Launch notepad)."""
+        # Step 1: Simulate user saying "Ultron"
         speech_events = []
         wake_events = []
         
         event_bus.subscribe("SPEECH_RECOGNIZED", lambda e: speech_events.append(e.payload))
         event_bus.subscribe("WAKE_DETECTED", lambda e: wake_events.append(e.payload))
 
-        # Feed "arise" directly to recognition service handler
-        self.recognition_service._handle_speech("arise", 1.0)
+        # Feed "ultron" directly to recognition service handler
+        self.recognition_service._handle_speech("ultron", 1.0)
         
         # Verify SPEECH_RECOGNIZED and WAKE_DETECTED were published
-        self.assertTrue(any(e["text"] == "arise" for e in speech_events))
+        self.assertTrue(any(e["text"] == "ultron" for e in speech_events))
         self.assertEqual(len(wake_events), 1)
         
         # Verify State transitioned to Listening
@@ -153,7 +153,7 @@ class TestFirstAwakening(unittest.TestCase):
         self.session_manager.transition_to(VoiceState.SLEEPING)
         
         # Trigger wake
-        self.recognition_service._handle_speech("arise", 1.0)
+        self.recognition_service._handle_speech("ultron", 1.0)
         self.assertEqual(state_manager.state, "Listening")
         
         # Simulate timeout
@@ -163,7 +163,7 @@ class TestFirstAwakening(unittest.TestCase):
         self.assertEqual(state_manager.state, "Sleeping")
         
         # Trigger wake again
-        self.recognition_service._handle_speech("arise", 1.0)
+        self.recognition_service._handle_speech("ultron", 1.0)
         self.assertEqual(state_manager.state, "Listening")
 
 if __name__ == "__main__":

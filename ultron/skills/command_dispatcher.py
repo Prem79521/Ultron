@@ -30,15 +30,10 @@ class CommandDispatcher(CognitiveSkill):
         start_step = time.time()
         self.core.events.publish("PipelineStepStarted", {"step": "Context"})
         
-        pref_records = self.memory.list_records("preference", limit=100)
-        display_name = "Prem"
-        display_name_found = False
-        for r in pref_records:
-            if r["title"] == "display_name":
-                display_name = r["content"]
-                display_name_found = True
-        
-        mem_accessed = "preference_memory (SQL)"
+        from ultron.core.operator import load_operator_profile
+        profile = load_operator_profile()
+        display_name = profile.get("display_name", "Prem")
+        mem_accessed = "operator_profile.json"
         dur = (time.time() - start_step) * 1000
         self.core.logger.info("Context", f"Resolved operator: '{display_name}' | Memory: {mem_accessed} | Duration: {dur:.1f}ms | Status: SUCCESS")
         
@@ -69,19 +64,44 @@ class CommandDispatcher(CognitiveSkill):
             }
 
         plan = ExecutionPlan(command_text)
-        
-        is_arise = command_text.lower() == "arise"
-        is_continue_rowdy = "continue rowdy" in command_text.lower()
-        
-        if is_arise:
+
+        # Resolve active wake phrase dynamically so it follows config without code changes
+        try:
+            from ultron.core.service_manager import service_manager as _sm
+            _eng = _sm.get_service("VoiceEngineService")
+            _active_wake = _eng.wake_phrase.lower().strip() if (_eng and _eng.wake_phrase) else "ultron"
+        except Exception:
+            _active_wake = "ultron"
+            
+        cmd_lower = command_text.lower().strip()
+        is_wake = cmd_lower == _active_wake
+        is_create_project = cmd_lower.startswith("create project ") or cmd_lower.startswith("start project ")
+        is_continue_project = cmd_lower.startswith("continue project") or cmd_lower.startswith("continue")
+
+        if is_wake:
             plan.tasks.append(Task("task_verify_memory", "Verify Memory Engine availability"))
             plan.tasks.append(Task("task_verify_skills", "Verify Skills Registry health"))
             plan.tasks.append(Task("task_verify_voice", "Verify Voice Provider connection"))
-        elif is_continue_rowdy:
-            plan.tasks.append(Task("task_get_project", "Query ROWDY metadata from Project Memory"))
-            plan.tasks.append(Task("task_verify_fs", "Verify ROWDY workspace directory path"))
-            plan.tasks.append(Task("task_launch_editor", "Launch VS Code editor inside project"))
-            plan.tasks.append(Task("task_launch_shell", "Open terminal shell inside project"))
+        elif is_create_project:
+            if cmd_lower.startswith("create project "):
+                proj_name = command_text[len("create project "):].strip()
+            else:
+                proj_name = command_text[len("start project "):].strip()
+            plan.tasks.append(Task("task_create_project", f"Create project {proj_name} in Project Memory"))
+            plan.tasks.append(Task("task_verify_fs", f"Verify workspace directory path"))
+            plan.tasks.append(Task("task_launch_editor", f"Launch VS Code editor inside project"))
+            plan.tasks.append(Task("task_launch_shell", f"Open terminal shell inside project"))
+        elif is_continue_project:
+            if cmd_lower.startswith("continue project "):
+                proj_name = command_text[len("continue project "):].strip()
+            elif cmd_lower.startswith("continue "):
+                proj_name = command_text[len("continue "):].strip()
+            else:
+                proj_name = ""
+            plan.tasks.append(Task("task_get_project", f"Query {proj_name if proj_name else 'active'} metadata from Project Memory"))
+            plan.tasks.append(Task("task_verify_fs", f"Verify workspace directory path"))
+            plan.tasks.append(Task("task_launch_editor", f"Launch VS Code editor inside project"))
+            plan.tasks.append(Task("task_launch_shell", f"Open terminal shell inside project"))
         else:
             plan.tasks.append(Task("task_unknown", "Unknown command fallback"))
             
@@ -121,34 +141,55 @@ class CommandDispatcher(CognitiveSkill):
                 elif task.task_id == "task_verify_voice":
                     skill_used = "Voice"
                     task_result = {"success": True, "output": "Voice provider verified: pyttsx3 online."}
+                elif task.task_id == "task_create_project":
+                    skill_used = "ProjectManager"
+                    mem_accessed_task = "project_memory"
+                    pm = self.core.get_module("skills_registry").get_skill("ProjectManager")
+                    if cmd_lower.startswith("create project "):
+                        p_name = command_text[len("create project "):].strip()
+                    else:
+                        p_name = command_text[len("start project "):].strip()
+                    task_result = pm.execute({"action": "create_project", "project_name": p_name})
                 elif task.task_id == "task_get_project":
                     skill_used = "ProjectManager"
                     mem_accessed_task = "project_memory"
                     pm = self.core.get_module("skills_registry").get_skill("ProjectManager")
-                    task_result = pm.execute({"action": "get_status", "project_name": "ROWDY"})
+                    if cmd_lower.startswith("continue project "):
+                        p_name = command_text[len("continue project "):].strip()
+                    elif cmd_lower.startswith("continue "):
+                        p_name = command_text[len("continue "):].strip()
+                    else:
+                        p_name = ""
+                    task_result = pm.execute({"action": "get_status", "project_name": p_name})
                 elif task.task_id == "task_verify_fs":
                     skill_used = "FileSystem"
-                    prev_out = next((r for r in results if r["task_id"] == "task_get_project"), None)
+                    prev_out = next((r for r in results if r["task_id"] in ["task_get_project", "task_create_project"]), None)
                     if prev_out and prev_out.get("success"):
-                        directory = prev_out.get("directory", os.getcwd())
+                        directory = prev_out.get("output", {}).get("directory") if isinstance(prev_out.get("output"), dict) else prev_out.get("directory", os.getcwd())
+                        if not directory:
+                            directory = os.getcwd()
                         fs = self.core.get_module("skills_registry").get_skill("FileSystem")
                         task_result = fs.execute({"action": "exists", "path": directory})
                     else:
                         task_result = {"success": False, "error": "Missing project metadata"}
                 elif task.task_id == "task_launch_editor":
                     skill_used = "Terminal"
-                    prev_out = next((r for r in results if r["task_id"] == "task_get_project"), None)
+                    prev_out = next((r for r in results if r["task_id"] in ["task_get_project", "task_create_project"]), None)
                     if prev_out and prev_out.get("success"):
-                        directory = prev_out.get("directory", os.getcwd())
+                        directory = prev_out.get("output", {}).get("directory") if isinstance(prev_out.get("output"), dict) else prev_out.get("directory", os.getcwd())
+                        if not directory:
+                            directory = os.getcwd()
                         term = self.core.get_module("skills_registry").get_skill("Terminal")
                         task_result = term.execute({"action": "execute_command", "command": f"code '{directory}'"})
                     else:
                         task_result = {"success": False, "error": "Missing project path"}
                 elif task.task_id == "task_launch_shell":
                     skill_used = "Terminal"
-                    prev_out = next((r for r in results if r["task_id"] == "task_get_project"), None)
+                    prev_out = next((r for r in results if r["task_id"] in ["task_get_project", "task_create_project"]), None)
                     if prev_out and prev_out.get("success"):
-                        directory = prev_out.get("directory", os.getcwd())
+                        directory = prev_out.get("output", {}).get("directory") if isinstance(prev_out.get("output"), dict) else prev_out.get("directory", os.getcwd())
+                        if not directory:
+                            directory = os.getcwd()
                         term = self.core.get_module("skills_registry").get_skill("Terminal")
                         task_result = term.execute({"action": "open_terminal", "directory": directory})
                     else:
@@ -164,7 +205,7 @@ class CommandDispatcher(CognitiveSkill):
                 "task_id": task.task_id,
                 "description": task.description,
                 "success": task_result.get("success"),
-                "output": task_result.get("output", ""),
+                "output": task_result.get("output", "") if "output" in task_result else task_result,
                 "error": task_result.get("error", "")
             })
             
@@ -179,25 +220,39 @@ class CommandDispatcher(CognitiveSkill):
         start_step = time.time()
         self.core.events.publish("PipelineStepStarted", {"step": "Reflection"})
         
-        if is_arise:
+        if is_wake:
             dialogue_text = (
                 f"Online, {display_name}.\n"
                 "All core systems are operational.\n"
                 "What are we building today?"
             )
-        elif is_continue_rowdy:
+        elif is_create_project:
+            proj_res = next((r for r in results if r["task_id"] == "task_create_project"), None)
+            if proj_res and proj_res.get("success"):
+                p_name_res = proj_res["output"].get("project_name", "") if isinstance(proj_res.get("output"), dict) else proj_res.get("project_name", "")
+                dialogue_text = f"Project {p_name_res} created successfully. Workspace initialized."
+            else:
+                err = proj_res.get("error") if proj_res else "Task failed"
+                if not err:
+                    err = proj_res.get("output", {}).get("error") if (proj_res and isinstance(proj_res.get("output"), dict)) else "Failed"
+                dialogue_text = f"Failed to create project: {err}"
+        elif is_continue_project:
             proj_res = next((r for r in results if r["task_id"] == "task_get_project"), None)
             if proj_res and proj_res.get("success"):
-                last_milestone = proj_res["output"].get("last_milestone", "Seller Dashboard")
-                priority_task = proj_res["output"].get("priority_task", "Payment Integration")
+                p_name_res = proj_res["output"].get("project_name", "") if isinstance(proj_res.get("output"), dict) else proj_res.get("project_name", "")
+                last_milestone = proj_res["output"].get("last_milestone", "None") if isinstance(proj_res.get("output"), dict) else "None"
+                priority_task = proj_res["output"].get("priority_task", "None") if isinstance(proj_res.get("output"), dict) else "None"
                 dialogue_text = (
-                    "Project ROWDY recovered successfully.\n"
+                    f"Project {p_name_res} recovered successfully.\n"
                     f"Last completed milestone: {last_milestone}.\n"
                     f"Highest priority task: {priority_task}.\n"
                     "Development environment is ready."
                 )
             else:
-                dialogue_text = f"Failed to recover ROWDY project metadata from memory, {display_name}."
+                err = proj_res.get("error") if proj_res else "Project not found"
+                if not err:
+                    err = proj_res.get("output", {}).get("error") if (proj_res and isinstance(proj_res.get("output"), dict)) else "Project not found"
+                dialogue_text = err
         else:
             dialogue_text = f"I've processed your query, {display_name}."
             

@@ -12,6 +12,8 @@ class SapiWakeProvider(WakeWordProvider):
         self.logger = logging.getLogger("ultron-agent")
 
     def process_speech(self, text: str, confidence: float = 1.0):
+        import threading, datetime
+        print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] HOP3: SapiWakeProvider.process_speech | active={self.active} | text='{text}'")
         if not self.active:
             return
         
@@ -37,6 +39,8 @@ class SapiWakeProvider(WakeWordProvider):
                     f"Confidence:\n{confidence}\n\n"
                     f"Publishing:\nWAKE_DETECTED"
                 )
+                import threading, datetime
+                print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] HOP4: wake callback firing | callback={self.callback}")
                 if self.callback:
                     self.callback()
                 break

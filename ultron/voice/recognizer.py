@@ -43,6 +43,8 @@ class RecognitionService(UltronService):
         return "Offline"
 
     def _handle_speech(self, text: str, confidence: float):
+        import threading, datetime
+        print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] HOP1: _handle_speech fired | obj={id(self)} | text='{text}'")
         if not self.active:
             return
             

@@ -54,6 +54,8 @@ from ultron.voice.engine import enumerate_and_select_microphone
 from ultron.core.health_monitor import health_monitor
 from ui.application import UltronUIApplication
 
+_main_window_ref = None
+
 def handle_voice_command(text: str):
     """Voice command router mapping callbacks to wake checks or queue execution."""
     text = text.strip()
@@ -68,7 +70,7 @@ def handle_voice_command(text: str):
     
     # Do not execute the wake word itself as a command
     engine_srv = service_manager.get_service("VoiceEngineService")
-    wake_phrase = engine_srv.wake_phrase.lower().strip() if (engine_srv and engine_srv.wake_phrase) else "arise"
+    wake_phrase = engine_srv.wake_phrase.lower().strip() if (engine_srv and engine_srv.wake_phrase) else "ultron"
     if text.lower().strip() == wake_phrase:
         logging.getLogger("ultron-agent").info(f"handle_voice_command: Skipping command execution for wake phrase '{text}'.")
         return
@@ -95,9 +97,14 @@ def handle_voice_command(text: str):
     
     # AI Core must reject commands when VOICE_STATE != LISTENING
     if is_listening:
-        ai = get_ai_core()
-        if ai:
-            ai.execute_command(text)
+        global _main_window_ref
+        if _main_window_ref:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: _main_window_ref.process_operator_command(text, is_voice=True))
+        else:
+            ai = get_ai_core()
+            if ai:
+                ai.execute_command(text)
 
 def verify_runtime_status(main_window, session_mgr, wake):
     failures = []
@@ -277,6 +284,8 @@ def verify_runtime_status(main_window, session_mgr, wake):
 
 def complete_boot_from_ui(main_window, memory, voice, skills):
     """Callback triggered on the main thread after boot screen POST completes."""
+    global _main_window_ref
+    _main_window_ref = main_window
     import threading
     import logging
     logger = logging.getLogger("ultron-agent")
@@ -350,6 +359,14 @@ def complete_boot_from_ui(main_window, memory, voice, skills):
         service_manager.register_service("NotificationService", notification_center)
         service_manager.register_service("HealthMonitorService", health_monitor)
         
+        # Register first-class MCP Service
+        try:
+            from mcp.service import McpService
+            mcp_srv = McpService()
+            service_manager.register_service("McpService", mcp_srv)
+        except Exception as e:
+            logger.error(f"Failed to register McpService: {e}", exc_info=True)
+        
         log_boot(8, "Plugins initialized")
     except Exception as e:
         logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error initializing plugins/vision services: {e}", exc_info=True)
@@ -380,85 +397,69 @@ def complete_boot_from_ui(main_window, memory, voice, skills):
     except Exception as e:
         logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error updating AI Core references: {e}", exc_info=True)
         
-    # Start all services
-    try:
-        service_manager.start_all()
-    except Exception as e:
-        logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error starting services: {e}", exc_info=True)
-    
-    # Expose SpeechService
+    # Expose SpeechService (fast — just dict assignment)
     try:
         if voice:
             service_manager.register_service("SpeechService", voice)
     except Exception as e:
         logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error exposing SpeechService: {e}", exc_info=True)
+
+    # Phase 9 Memory Verification
+    try:
+        projs = memory.list_records("project", limit=100)
+        convs = memory.list_records("conversation", limit=100)
+        facts = memory.list_records("preference", limit=100)
         
-    try:
-        log_boot(9, "Boot complete")
+        if len(projs) == 0 and len(convs) == 0 and len(facts) == 0:
+            print("Memory initialized.\n0 Projects\n0 Conversations\n0 Facts\nOperator profile ready.")
+            logger.info("Memory initialized.\n0 Projects\n0 Conversations\n0 Facts\nOperator profile ready.")
     except Exception as e:
-        logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error logging boot complete: {e}", exc_info=True)
-    
-    # Emit BOOT_COMPLETED event (Phase 5)
-    t_pub = time.time()
-    try:
-        event_bus.publish("BOOT_COMPLETED", {"status": "SUCCESS"})
-        dur_pub = (time.time() - t_pub) * 1000
-        log_boot_stage(15, "BOOT_COMPLETED Published", "PASS", dur_pub)
-    except Exception as e:
-        dur_pub = (time.time() - t_pub) * 1000
-        logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error publishing BOOT_COMPLETED: {e}", exc_info=True)
-        log_boot_stage(15, f"BOOT_COMPLETED Publish Failed: {e}", "FAIL", dur_pub)
-    
-    # Run health verification checks
-    try:
-        verify_runtime_status(main_window, session_mgr, wake)
-    except Exception as e:
-        logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Verification loop warning: {e}", exc_info=True)
-        
-    try:
-        event_bus.log_subscribers()
-    except Exception as e:
-        logger.error(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] Error logging EventBus subscribers: {e}", exc_info=True)
+        logger.error(f"[BOOT TRACK] Error validating memory: {e}")
+
+    # NOTE: service_manager.start_all() is intentionally NOT called here.
+    # It runs in ServiceStartupThread (ui/application.py) AFTER MainWindow.show()
+    # so the Qt Main Thread is never blocked by model loading.
+    logger.info(f"[BOOT TRACK] [Thread: {threading.current_thread().name}] complete_boot_from_ui: service registration complete — start_all deferred to background thread.")
 
 
 def verify_application_ready(main_window) -> bool:
     logger = logging.getLogger("ultron-agent")
-    
-    # 1. Main Window Visible
+
+    # 1. Main Window Visible — hard requirement
     if not main_window or not main_window.isVisible():
         logger.warning("[BOOT] UI Readiness: Main Window is NOT visible.")
         return False
-        
-    # 2. EventBus Active
+
+    # 2. EventBus Active — hard requirement
     from ultron.core.event_bus import event_bus
     if not event_bus or event_bus.health().get("status") != "healthy":
         logger.warning("[BOOT] UI Readiness: EventBus is NOT active.")
         return False
-        
-    # 3. VoiceSessionManager READY/SLEEPING
+
+    # 3. VoiceSessionManager READY/SLEEPING — hard requirement
     from ultron.core.voice_session_manager import get_voice_session_manager, VoiceState
     mgr = get_voice_session_manager()
     if not mgr or mgr.state not in [VoiceState.SLEEPING]:
-        logger.warning(f"[BOOT] UI Readiness: VoiceSessionManager is NOT ready/sleeping (State: {mgr.state if mgr else 'None'}).")
+        logger.warning(f"[BOOT] UI Readiness: VoiceSessionManager NOT ready (State: {mgr.state if mgr else 'None'}).")
         return False
-        
-    # 4. Recognition READY
+
+    # 4. Recognition — soft check (Vosk model loads in background thread)
     reco = service_manager.get_service("VoiceRecognitionService")
     if not reco or not reco.is_active():
-        logger.warning("[BOOT] UI Readiness: Recognition Service is NOT active.")
-        return False
-        
-    # 5. Wake READY
+        logger.warning("[BOOT] UI Readiness: Recognition Service not yet active (may still be initializing).")
+        # Do not return False — voice loads async
+
+    # 5. Wake — soft check (starts after recognition engine starts)
     wake = service_manager.get_service("WakeService")
     if not wake or not wake.is_active():
-        logger.warning("[BOOT] UI Readiness: Wake Service is NOT active.")
-        return False
-        
+        logger.warning("[BOOT] UI Readiness: Wake Service not yet active (may still be initializing).")
+        # Do not return False — starts async
+
     # 6. Input Enabled
     if not main_window.cmd_input.isEnabled():
         logger.warning("[BOOT] UI Readiness: Command Input is disabled.")
         return False
-        
+
     return True
 
 def main():

@@ -11,7 +11,11 @@ class UltronWakeEngine(UltronService):
         super().__init__("WakeService")
         self.voice = voice_provider
         self.logger = logging.getLogger("ultron-agent")
-        self.display_name = "Prem"
+        try:
+            from ultron.core.operator import load_operator_profile
+            self.display_name = load_operator_profile().get("display_name", "Prem")
+        except Exception:
+            self.display_name = "Prem"
 
     def start(self) -> bool:
         self.active = True

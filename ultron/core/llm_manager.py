@@ -32,7 +32,7 @@ class UltronLLMManager:
         """Runs offline local model generation (v1.0 placeholder backend)."""
         self.logger.info(f"Generating inference using model: {self.active_model}")
         # Local mock heuristics
-        if "arise" in prompt.lower():
+        if "ultron" in prompt.lower():
             return "Online. All core systems are operational."
         return "Directive processed."
 

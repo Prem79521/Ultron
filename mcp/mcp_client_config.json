@@ -1,0 +1,17 @@
+{
+  "claude_desktop": {
+    "mcpServers": {
+      "ultron-cognitive-os": {
+        "command": "python",
+        "args": [
+          "c:/Users/craft/Desktop/Ultron/mcp/server.py"
+        ]
+      }
+    }
+  },
+  "cursor": {
+    "name": "ultron-cognitive-os",
+    "type": "command",
+    "command": "python c:/Users/craft/Desktop/Ultron/mcp/server.py"
+  }
+}

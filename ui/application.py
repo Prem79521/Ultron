@@ -5,10 +5,80 @@ ULTRON UI Application — Presentation bootstrap manager running PySide6 QApplic
 import sys
 import time
 import logging
+import threading
+import datetime
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot
 from ui.boot_screen import UltronBootScreen, log_boot_stage
 from ui.main_window import UltronMainWindow
+
+
+class ServiceStartupThread(QThread):
+    """
+    Runs service_manager.start_all() on a worker thread so the Qt Main Thread
+    is never blocked by model loading (e.g. vosk.Model()).
+
+    Emits per-service timing and a startup_complete signal when done.
+    """
+    service_timed = Signal(str, float)   # (service_name, duration_ms)
+    startup_complete = Signal()
+
+    def run(self):
+        from ultron.core.service_manager import service_manager
+        from ultron.core.event_bus import event_bus
+        logger = logging.getLogger("ultron-agent")
+
+        # --- Topological ordering (mirrors service_manager.start_all) ---
+        visited, temp_mark, order = set(), set(), []
+
+        def visit(name):
+            if name in temp_mark or name in visited:
+                return
+            temp_mark.add(name)
+            srv = service_manager.get_service(name)
+            if srv:
+                for dep in srv.dependencies:
+                    visit(dep)
+            temp_mark.discard(name)
+            visited.add(name)
+            order.append(name)
+
+        for name in list(service_manager._services.keys()):
+            visit(name)
+
+        logger.info(f"[ServiceStartupThread] Resolved service order: {order}")
+        print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] ServiceStartupThread: starting {len(order)} services")
+
+        # --- Timed startup per service ---
+        for name in order:
+            t0 = time.time()
+            try:
+                service_manager.start_service(name)
+            except Exception as e:
+                logger.error(f"[ServiceStartupThread] {name} failed to start: {e}", exc_info=True)
+            dur = (time.time() - t0) * 1000
+            self.service_timed.emit(name, dur)
+            level = "WARNING" if dur > 100 else "INFO"
+            msg = f"[ServiceStartupThread] {name}: {dur:.0f} ms{' ← SLOW (>100ms)' if dur > 100 else ''}"
+            getattr(logger, level.lower())(msg)
+            print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}")
+
+        # --- Post-startup: BOOT_COMPLETED + subscriber log ---
+        t_pub = time.time()
+        try:
+            event_bus.publish("BOOT_COMPLETED", {"status": "SUCCESS"})
+            log_boot_stage(15, "BOOT_COMPLETED Published", "PASS", (time.time() - t_pub) * 1000)
+        except Exception as e:
+            log_boot_stage(15, f"BOOT_COMPLETED Publish Failed: {e}", "FAIL", 0.0)
+
+        try:
+            event_bus.log_subscribers()
+        except Exception:
+            pass
+
+        print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] ServiceStartupThread: all services started")
+        self.startup_complete.emit()
+
 
 class UltronUIApplication:
     def __init__(self, core_system):
@@ -16,7 +86,8 @@ class UltronUIApplication:
         self.app = QApplication.instance() or QApplication(sys.argv)
         self.boot_screen = None
         self.main_window = None
-        
+        self._service_thread = None  # kept alive as member so GC doesn't collect it
+
         # Watchdog setup (Phase 10)
         self.watchdog_timer = QTimer()
         self.watchdog_timer.setSingleShot(True)
@@ -25,53 +96,108 @@ class UltronUIApplication:
     def start(self) -> int:
         """Launches the Splash Boot Screen and starts the QApplication event loop."""
         self.core.logger.info("SYSTEM", "Starting UI presentation layer runtime.")
-        
-        # Verify thread ownership of QApplication creation
-        import threading
-        thread_name = threading.current_thread().name
-        logging.getLogger("ultron-agent").info(f"QObject Thread (QApplication): {thread_name} " + ("✓ (MainThread)" if thread_name == "MainThread" else "✗ (WorkerThread)"))
 
-        # Instantiate and show Boot Splash Screen (Stage A)
+        thread_name = threading.current_thread().name
+        logging.getLogger("ultron-agent").info(
+            f"QObject Thread (QApplication): {thread_name} "
+            + ("✓ (MainThread)" if thread_name == "MainThread" else "✗ (WorkerThread)")
+        )
+
         self.boot_screen = UltronBootScreen(self.core)
         self.boot_screen.boot_completed.connect(self._on_boot_completed)
         self.boot_screen.start_boot()
-        
+
         return self.app.exec()
 
+    @Slot(object, object, object, object)
     def _on_boot_completed(self, core, memory, voice, skills):
-        """Callback invoked when splash boot tasks complete. Creates and opens the Main Window."""
+        """
+        Called on the Qt Main Thread after the splash POST finishes.
+
+        Phase A (Main Thread — fast):
+          1. Create MainWindow
+          2. Register all services  (complete_boot_from_ui)
+          3. MainWindow.show()      ← UI is live HERE
+
+        Phase B (ServiceStartupThread — background):
+          4. service_manager.start_all() with per-service timing
+          5. BOOT_COMPLETED event
+          6. verify_application_ready
+        """
         t_start = time.time()
         log_boot_stage(12, "complete_boot() Started", "PASS", 0.0)
-        
-        # Start watchdog (Phase 10)
-        self.watchdog_timer.start(5000)
-        
-        import threading
-        thread_name = threading.current_thread().name
-        logging.getLogger("ultron-agent").info(f"QObject Thread (ui_application callback): {thread_name} " + ("✓ (MainThread)" if thread_name == "MainThread" else "✗ (WorkerThread)"))
 
-        # Instantiation with persistent application member reference (Phase 6)
+        self.watchdog_timer.start(15000)  # generous: Vosk model load can take ~10s
+
+        thread_name = threading.current_thread().name
+        logging.getLogger("ultron-agent").info(
+            f"QObject Thread (ui_application callback): {thread_name} "
+            + ("✓ (MainThread)" if thread_name == "MainThread" else "✗ (WorkerThread)")
+        )
+
+        # ── Phase A-1: create MainWindow ──────────────────────────────────────
         try:
             t_create = time.time()
             logging.getLogger("ultron-agent").info("Creating MainWindow")
             self.main_window = UltronMainWindow(core, memory, voice)
-            dur_create = (time.time() - t_create) * 1000
-            log_boot_stage(13, "MainWindow Created", "PASS", dur_create)
-            
-            mw_thread = self.main_window.thread().objectName() or "MainThread"
-            logging.getLogger("ultron-agent").info(f"QObject Thread (MainWindow): {mw_thread} ✓ (MainThread)")
+            log_boot_stage(13, "MainWindow Created", "PASS", (time.time() - t_create) * 1000)
         except Exception as e:
             log_boot_stage(13, f"MainWindow Created Failed: {e}", "FAIL", 0.0)
             logging.getLogger("ultron-agent").error("Exception during MainWindow instantiation", exc_info=True)
             return
 
-        # Bind skills, update AI Core, register services on main thread
-        import main
+        # ── Phase A-2: register services (fast — object construction only) ────
+        import main as _main
         try:
-            main.complete_boot_from_ui(self.main_window, memory, voice, skills)
+            _main.complete_boot_from_ui(self.main_window, memory, voice, skills)
         except Exception as e:
             logging.getLogger("ultron-agent").error(f"Error in complete_boot_from_ui: {e}", exc_info=True)
 
+        # ── Check profile and either show main window or onboarding wizard ────
+        from ultron.core.operator import operator_profile_exists, load_operator_profile
+        if operator_profile_exists():
+            self._show_main_window(core, memory, voice, skills)
+        else:
+            self.watchdog_timer.stop() # stop watchdog during onboarding
+            from ui.onboarding import OperatorOnboardingWizard
+            self.wizard = OperatorOnboardingWizard(core, memory, voice, skills)
+            
+            def handle_onboarding_done():
+                self.wizard.close()
+                # Load profile and apply settings
+                profile = load_operator_profile()
+                self.main_window.display_name = profile.get("display_name")
+                self.main_window.op_name.setText(self.main_window.display_name)
+                self.main_window.greeting_name_lbl.setText(f"{self.main_window.display_name}.")
+                
+                # Apply HAL permissions based on voice enabled
+                from ultron.hal.hal_manager import get_hal_manager
+                hal = get_hal_manager()
+                if hal:
+                    voice_active = profile.get("voice_enabled", False)
+                    hal.save_permission("microphone", voice_active)
+                    hal.save_permission("speaker", voice_active)
+                    self.main_window.mic_toggle.setChecked(voice_active)
+                    self.main_window.spk_toggle.setChecked(voice_active)
+                
+                # Update main settings display
+                try:
+                    self.main_window.update_operator_settings_display()
+                except Exception as e:
+                    logging.getLogger("ultron-agent").error(f"Error updating settings: {e}")
+                
+                # Resume normal boot
+                self.watchdog_timer.start(15000)
+                self._show_main_window(core, memory, voice, skills)
+                
+            self.wizard.onboarding_complete.connect(handle_onboarding_done)
+            self.wizard.show()
+            self.wizard.raise_()
+            self.wizard.activateWindow()
+
+    def _show_main_window(self, core, memory, voice, skills):
+        t_start = time.time()
+        # ── Phase A-3: show the window — Qt event loop becomes responsive ─────
         try:
             t_show = time.time()
             logging.getLogger("ultron-agent").info("MainWindow.show() called")
@@ -81,87 +207,92 @@ class UltronUIApplication:
             self.main_window.repaint()
             self.main_window.update()
             logging.getLogger("ultron-agent").info("MainWindow exposed")
-            dur_show = (time.time() - t_show) * 1000
-            log_boot_stage(14, "MainWindow show()", "PASS", dur_show)
+            log_boot_stage(14, "MainWindow show()", "PASS", (time.time() - t_show) * 1000)
         except Exception as e:
             log_boot_stage(14, f"MainWindow show() Failed: {e}", "FAIL", 0.0)
             logging.getLogger("ultron-agent").error("Exception showing MainWindow", exc_info=True)
 
-        # Audit visibility (Phase 5)
+        # Visibility audit
         is_vis = self.main_window.isVisible()
-        is_hid = self.main_window.isHidden()
-        win_state = self.main_window.windowState()
-        is_min = self.main_window.isMinimized()
-        geom = self.main_window.geometry()
-        scr = self.main_window.screen()
         logging.getLogger("ultron-agent").info(
             f"MainWindow Visibility Audit:\n"
             f"- isVisible(): {is_vis}\n"
-            f"- isHidden(): {is_hid}\n"
-            f"- windowState(): {win_state}\n"
-            f"- isMinimized(): {is_min}\n"
-            f"- geometry(): {geom}\n"
-            f"- screen(): {scr.name() if scr else 'None'}"
+            f"- isHidden(): {self.main_window.isHidden()}\n"
+            f"- geometry(): {self.main_window.geometry()}"
         )
-
         if not is_vis:
-            logging.getLogger("ultron-agent").warning("MainWindow is not visible after show. Executing visibility recovery...")
+            logging.getLogger("ultron-agent").warning("MainWindow not visible after show — attempting recovery")
             try:
                 self.main_window.show()
                 self.main_window.raise_()
                 self.main_window.activateWindow()
-                self.main_window.repaint()
-                self.main_window.update()
             except Exception as e:
                 logging.getLogger("ultron-agent").error(f"Visibility recovery failed: {e}", exc_info=True)
-                
-        # Stop watchdog if window is visible
+
         if self.main_window.isVisible():
             self.watchdog_timer.stop()
-            logging.getLogger("ultron-agent").info("MainWindow is visible. Boot watchdog timer stopped.")
-            
-        # 9. APPLICATION_READY verification (Phase 9)
-        t_ready = time.time()
+            logging.getLogger("ultron-agent").info("MainWindow is visible. Boot watchdog stopped.")
+
+        log_boot_stage(14, "UI Responsive", "PASS", (time.time() - t_start) * 1000)
+        print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread=MainThread] MainWindow visible — spawning ServiceStartupThread")
+
+        # ── Phase B: start services on background thread ──────────────────────
+        self._service_thread = ServiceStartupThread()
+        self._service_thread.service_timed.connect(self._on_service_timed)
+        self._service_thread.startup_complete.connect(self._on_services_started)
+        self._service_thread.start()
+
+    @Slot(str, float)
+    def _on_service_timed(self, name: str, dur_ms: float):
+        """Receives per-service timing from background thread (Qt-safe signal)."""
+        logging.getLogger("ultron-agent").info(f"[Startup Timing] {name}: {dur_ms:.0f} ms")
+
+    @Slot()
+    def _on_services_started(self):
+        """Called on Main Thread after all services have started in the background."""
+        logger = logging.getLogger("ultron-agent")
+        logger.info("[ServiceStartupThread] All services started — running readiness check")
+        print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread=MainThread] _on_services_started: verifying readiness")
+
+        import main as _main
         from ultron.core.event_bus import event_bus
-        if main.verify_application_ready(self.main_window):
-            dur_ready = (time.time() - t_ready) * 1000
-            log_boot_stage(17, "Dashboard Interactive", "PASS", dur_ready)
+
+        if self.main_window and _main.verify_application_ready(self.main_window):
+            log_boot_stage(17, "Dashboard Interactive", "PASS", 0.0)
             event_bus.publish("APPLICATION_READY", {"status": "SUCCESS"})
             log_boot_stage(18, "BOOT COMPLETE", "PASS", 0.0)
         else:
-            dur_ready = (time.time() - t_ready) * 1000
-            log_boot_stage(17, "Dashboard Interactive Checks Failed", "FAIL", dur_ready)
+            log_boot_stage(17, "Dashboard Interactive Checks Failed (voice services may still be initializing)", "WARNING", 0.0)
+            logger.warning("[BOOT] verify_application_ready returned False — voice may still be loading in background")
+
+        # Run verbose pipeline check
+        try:
+            from ultron.core.voice_session_manager import get_voice_session_manager
+            mgr = get_voice_session_manager()
+            _main.verify_runtime_status(self.main_window, mgr, None)
+        except Exception as e:
+            logger.error(f"verify_runtime_status warning: {e}", exc_info=True)
 
     def _run_boot_watchdog(self):
         logging.getLogger("ultron-agent").error("===== BOOT WATCHDOG TRIGGERED =====")
-        import threading
         thread_name = threading.current_thread().name
-        
-        # Get visible windows
         from PySide6.QtWidgets import QApplication
-        visible_wins = []
-        for w in QApplication.topLevelWidgets():
-            if w.isVisible():
-                visible_wins.append(w.__class__.__name__)
-                
-        # Service States
+        visible_wins = [w.__class__.__name__ for w in QApplication.topLevelWidgets() if w.isVisible()]
+
         from ultron.core.service_manager import service_manager
-        services = []
-        for s_name in service_manager.list_services():
-            srv = service_manager.get_service(s_name)
-            services.append(f"{s_name}: {srv.status() if hasattr(srv, 'status') else 'Unknown'}")
-            
-        # Voice Session State
+        services = [
+            f"{s}: {service_manager.get_service(s).status() if hasattr(service_manager.get_service(s), 'status') else 'Unknown'}"
+            for s in service_manager.list_services()
+        ]
+
         from ultron.core.voice_session_manager import get_voice_session_manager
         mgr = get_voice_session_manager()
         voice_state = mgr.state.name if mgr else "None"
-        
-        # Event Queue length
+
         from ultron.core.ai_core import get_ai_core
         ai = get_ai_core()
         q_len = ai.queue.get_count() if ai else 0
-        
-        # Print report
+
         logging.getLogger("ultron-agent").error(
             f"- Current Thread: {thread_name}\n"
             f"- Visible Windows: {visible_wins}\n"
@@ -174,7 +305,4 @@ class UltronUIApplication:
     def health(self) -> dict:
         if not self.app:
             return {"status": "degraded", "details": "QApplication not initialized"}
-        return {
-            "status": "healthy",
-            "details": "PySide6 QApplication event loop active."
-        }
+        return {"status": "healthy", "details": "PySide6 QApplication event loop active."}

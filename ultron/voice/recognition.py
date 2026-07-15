@@ -70,7 +70,7 @@ class SapiEvents:
 
 class SapiSpeechListener(UltronService):
     """Offline SAPI5 listener managed as an OS service using In-Process Recognizer."""
-    def __init__(self, callback_func, wake_word: str = "arise"):
+    def __init__(self, callback_func, wake_word: str = "ultron"):
         super().__init__("VoiceRecognitionService")
         self.callback = callback_func
         self.wake_word = normalize_phrase(wake_word)
