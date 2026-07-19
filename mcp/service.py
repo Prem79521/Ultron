@@ -17,6 +17,9 @@ if mcp_dir not in sys.path:
     sys.path.insert(0, mcp_dir)
 sys.path = [p for p in sys.path if p != root_dir]
 
+# (Removed to avoid KeyError during package load; handled inside initialize instead)
+
+
 class McpService(UltronService):
     """Lifecycle service hosting the Model Context Protocol (MCP) server asynchronously."""
     
@@ -38,6 +41,19 @@ class McpService(UltronService):
         super().initialize()
         
         try:
+            # Adjust sys.path and remove local 'mcp' from sys.modules
+            mcp_dir = os.path.dirname(os.path.abspath(__file__))
+            root_dir = os.path.dirname(mcp_dir)
+            if mcp_dir not in sys.path:
+                sys.path.insert(0, mcp_dir)
+            sys.path = [p for p in sys.path if p != root_dir]
+            
+            if "mcp" in sys.modules:
+                mcp_mod = sys.modules["mcp"]
+                mcp_file = getattr(mcp_mod, "__file__", "")
+                if mcp_file and (mcp_file.startswith(root_dir) or "site-packages" not in mcp_file):
+                    del sys.modules["mcp"]
+            
             # Import FastMCP now that sys.path is adjusted
             from mcp.server.fastmcp import FastMCP
             import server as mcp_server_module

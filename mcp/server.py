@@ -4,12 +4,27 @@ Can be run standalone: python mcp/server.py
 Or as part of the ULTRON Cognitive OS service loop.
 """
 
+import os
+import sys
+
+# Adjust sys.path immediately to prevent local 'mcp' folder from masking the installed 'mcp' library
+mcp_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(mcp_dir)
+if mcp_dir not in sys.path:
+    sys.path.insert(0, mcp_dir)
+sys.path = [p for p in sys.path if p != root_dir]
+
+# Remove the local 'mcp' module from sys.modules to force loading the real installed 'mcp' library
+if "mcp" in sys.modules:
+    mcp_mod = sys.modules["mcp"]
+    mcp_file = getattr(mcp_mod, "__file__", "")
+    if mcp_file and (mcp_file.startswith(root_dir) or "site-packages" not in mcp_file):
+        del sys.modules["mcp"]
+
 from mcp.server.fastmcp import FastMCP
 import importlib
 import pkgutil
 import logging
-import os
-import sys
 
 # Configure logging
 logger = logging.getLogger("ultron-agent")
