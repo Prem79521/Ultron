@@ -1,6 +1,10 @@
 @echo off
 echo Starting ULTRON...
-python main.py
+if exist .venv\Scripts\python.exe (
+    .venv\Scripts\python.exe main.py
+) else (
+    python main.py
+)
 echo.
 echo ============================
 echo ULTRON exited.

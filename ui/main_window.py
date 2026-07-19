@@ -14,11 +14,13 @@ from PySide6.QtWidgets import (
     QScrollArea, QFormLayout, QComboBox, QGroupBox, QGridLayout, QApplication, QTextBrowser,
     QDialog, QFileDialog
 )
-from PySide6.QtCore import Qt, QSize, Slot, QTimer
+from PySide6.QtCore import Qt, QSize, Slot, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QShortcut, QKeySequence, QIcon, QPainter, QPen, QColor, QBrush, QPainterPath
 from ui.themes import UltronColors, UltronThemeStyles
 from ui.animations import UltronAnimations
 from ui.waveform import UltronWaveform
+from ui.reactor import UltronReactorWidget
+from ui.camera_preview import UltronCameraPreviewWidget
 from ui.developer_console import UltronDeveloperConsole
 from ultron.core.event_bus import event_bus
 from ultron.core.task_manager import task_manager
@@ -41,6 +43,12 @@ def safe_create_widget(class_name, parent=None, *args, **kwargs):
             if class_name == "UltronWaveformWidget":
                 from ui.waveform import UltronWaveform
                 cls = UltronWaveform
+            elif class_name == "UltronReactorWidget":
+                from ui.reactor import UltronReactorWidget
+                cls = UltronReactorWidget
+            elif class_name == "UltronCameraPreviewWidget":
+                from ui.camera_preview import UltronCameraPreviewWidget
+                cls = UltronCameraPreviewWidget
             elif class_name == "UltronRadarWidget":
                 cls = UltronRadarWidget
             elif class_name == "UltronTopBar":
@@ -342,6 +350,18 @@ class UltronTopBar(QWidget):
                     return
                 p = p.parent()
 
+    def toggle_fullscreen(self):
+        win = self.window()
+        if win and win != self and hasattr(win, "toggle_fullscreen"):
+            win.toggle_fullscreen()
+        else:
+            p = self.parent()
+            while p:
+                if hasattr(p, "toggle_fullscreen"):
+                    p.toggle_fullscreen()
+                    return
+                p = p.parent()
+
     def minimize_window(self):
         win = self.window()
         if win and win != self:
@@ -396,6 +416,11 @@ class UltronTopBar(QWidget):
         mini_btn.setStyleSheet("color: #A0A0A0; border: none; font-size: 14px; background: transparent;")
         mini_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         mini_btn.clicked.connect(self.minimize_window)
+
+        fs_btn = QPushButton("⛶")
+        fs_btn.setStyleSheet("color: #A0A0A0; border: none; font-size: 14px; background: transparent;")
+        fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        fs_btn.clicked.connect(self.toggle_fullscreen)
         
         close_btn = QPushButton("✕")
         close_btn.setStyleSheet("color: #A0A0A0; border: none; font-size: 14px; background: transparent;")
@@ -403,6 +428,7 @@ class UltronTopBar(QWidget):
         close_btn.clicked.connect(self.close_gracefully)
         
         control_layout.addWidget(mini_btn)
+        control_layout.addWidget(fs_btn)
         control_layout.addWidget(close_btn)
         layout.addWidget(control_widget)
 
@@ -480,7 +506,7 @@ class UltronSystemStatusWidget(QWidget):
     def update_stats(self):
         if self.has_psutil:
             import psutil
-            cpu = psutil.cpu_percent()
+            cpu = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory().percent
             self.cpu_history.append(cpu)
             self.mem_history.append(mem)
@@ -547,6 +573,313 @@ class UltronSystemStatusWidget(QWidget):
         painter.drawText(0, 110, "UPTIME")
         painter.setPen(QPen(QColor(200, 200, 200)))
         painter.drawText(width - 55, 110, f"{h:02d}:{m:02d}:{s:02d}")
+
+
+class UltronPerfCard(QFrame):
+    """Premium visual performance indicator card with neon status dot and progress bar."""
+    def __init__(self, title: str, unit: str, target: float, parent=None):
+        super().__init__(parent)
+        self.title_text = title
+        self.unit = unit
+        self.target = target
+        
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet("""
+            QFrame {
+                background-color: rgba(30, 30, 35, 0.4);
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                border-radius: 8px;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(6)
+        
+        # Header layout (title + status indicator dot)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setFont(QFont("Inter", 8, QFont.Weight.Bold))
+        self.lbl_title.setStyleSheet("color: #888888; border: none; background: transparent;")
+        header.addWidget(self.lbl_title)
+        
+        header.addStretch()
+        self.dot = QFrame()
+        self.dot.setFixedSize(6, 6)
+        self.dot.setStyleSheet("border-radius: 3px; background-color: #888888; border: none;")
+        header.addWidget(self.dot)
+        layout.addLayout(header)
+        
+        # Value label
+        self.lbl_value = QLabel("0.0")
+        self.lbl_value.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        self.lbl_value.setStyleSheet("color: #FFFFFF; border: none; background: transparent;")
+        layout.addWidget(self.lbl_value)
+        
+        # Progress bar
+        from PySide6.QtWidgets import QProgressBar
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(4)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: none;
+                border-radius: 2px;
+            }
+            QProgressBar::chunk {
+                background-color: #00F0FF;
+                border-radius: 2px;
+            }
+        """)
+        layout.addWidget(self.progress)
+
+    def update_metric(self, val: float, status: str = "normal"):
+        if self.unit == "%":
+            txt = f"{val:.1f}%"
+        elif self.unit == "ms":
+            txt = f"{val:.1f} ms"
+        elif self.unit == "MB":
+            txt = f"{val:.0f} MB"
+        elif self.unit == "/s":
+            txt = f"{val:.1f}/s"
+        elif self.unit == "count":
+            txt = f"{int(val)}"
+        else:
+            txt = f"{val:.1f} {self.unit}"
+            
+        self.lbl_value.setText(txt)
+        
+        pct = 0
+        if self.target > 0:
+            pct = min(100, int((val / self.target) * 100))
+        self.progress.setValue(pct)
+        
+        if status == "normal":
+            color_dot = "#00FFC4"
+            color_chunk = "#00F0FF"
+        elif status == "warning":
+            color_dot = "#FFB703"
+            color_chunk = "#FFB703"
+        else:
+            color_dot = "#FF3366"
+            color_chunk = "#FF3366"
+            
+        self.dot.setStyleSheet(f"border-radius: 3px; background-color: {color_dot}; border: none;")
+        self.progress.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border: none;
+                border-radius: 2px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {color_chunk};
+                border-radius: 2px;
+            }}
+        """)
+
+
+class _DashboardMetricsWorker(QThread):
+    """Gathers heavy metrics off the main thread to prevent UI thread lag."""
+    metrics_ready = Signal(dict)
+
+    def run(self):
+        try:
+            import os
+            import psutil
+            from ultron.core.service_manager import service_manager
+            from ultron.core.event_bus import event_bus
+            from ultron.core.task_manager import task_manager
+
+            # psutil CPU/RAM metrics
+            cpu = psutil.cpu_percent(interval=None)
+            proc = psutil.Process(os.getpid())
+            mem = proc.memory_info().rss / 1048576
+
+            # Camera Service metrics
+            cam_fps = 0.0
+            cam_dur = 0.0
+            cam_srv = service_manager.get_service("CameraService")
+            if cam_srv and cam_srv.active:
+                cam_fps = getattr(cam_srv, "camera_fps", 0.0)
+                cam_dur = getattr(cam_srv, "capture_time_ms", 0.0)
+
+            # Gesture Service metrics
+            gest_fps = 0.0
+            inf_dur = 0.0
+            gest_srv = service_manager.get_service("GestureService")
+            if gest_srv and gest_srv.active:
+                gest_fps = getattr(gest_srv, "gesture_fps", 0.0)
+                inf_dur = getattr(gest_srv, "inference_time_ms", 0.0)
+
+            # EventBus Rate
+            eb_rate = 0.0
+            try:
+                eb_rate = event_bus.get_events_per_second()
+            except Exception:
+                pass
+
+            # Command Queue length
+            q_len = 0
+            try:
+                from ultron.core.ai_core import get_ai_core
+                ai = get_ai_core()
+                if ai and ai.queue:
+                    q_len = ai.queue.get_count()
+            except Exception:
+                pass
+
+            self.metrics_ready.emit({
+                "cpu": cpu,
+                "mem": mem,
+                "cam_fps": cam_fps,
+                "cam_dur": cam_dur,
+                "gest_fps": gest_fps,
+                "inf_dur": inf_dur,
+                "eb_rate": eb_rate,
+                "q_len": q_len
+            })
+        except Exception:
+            pass
+
+
+class UltronPerformanceDashboard(QWidget):
+    """Real-time performance diagnostic grid showing CPU, Memory, Queue, and FPS metrics."""
+    def __init__(self, main_win, parent=None):
+        super().__init__(parent)
+        self.main_win = main_win
+        import logging
+        self.logger = logging.getLogger("ultron-agent")
+        self._worker = None
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(15)
+        
+        header_lbl = QLabel("SYSTEM PERFORMANCE & STABILITY")
+        header_lbl.setFont(QFont("Inter", 11, QFont.Weight.Bold))
+        header_lbl.setStyleSheet("color: #FFFFFF; letter-spacing: 1px;")
+        layout.addWidget(header_lbl)
+        
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        layout.addLayout(grid)
+        
+        self.card_ui_fps = UltronPerfCard("UI Frame Rate", "FPS", 60.0)
+        self.card_cam_fps = UltronPerfCard("Camera Stream", "FPS", 30.0)
+        self.card_gest_fps = UltronPerfCard("Inference Rate", "FPS", 25.0)
+        self.card_reactor_dur = UltronPerfCard("Reactor Render", "ms", 16.0)
+        self.card_cpu = UltronPerfCard("Processor Load", "%", 100.0)
+        self.card_memory = UltronPerfCard("Memory Usage", "MB", 2048.0)
+        self.card_eventbus = UltronPerfCard("EventBus Throughput", "/s", 50.0)
+        self.card_queue = UltronPerfCard("Command Queue", "count", 5.0)
+        
+        grid.addWidget(self.card_ui_fps, 0, 0)
+        grid.addWidget(self.card_cam_fps, 0, 1)
+        grid.addWidget(self.card_gest_fps, 0, 2)
+        grid.addWidget(self.card_reactor_dur, 0, 3)
+        grid.addWidget(self.card_cpu, 1, 0)
+        grid.addWidget(self.card_memory, 1, 1)
+        grid.addWidget(self.card_eventbus, 1, 2)
+        grid.addWidget(self.card_queue, 1, 3)
+        
+        # Raw Diagnostics panel
+        from PySide6.QtWidgets import QGroupBox, QTextBrowser
+        diag_group = QGroupBox("RAW SYSTEM DIAGNOSTICS & FORENSICS")
+        diag_group.setFont(QFont("Inter", 8, QFont.Weight.Bold))
+        diag_group.setStyleSheet("QGroupBox { color: #888888; border: 1px solid rgba(255,255,255,0.05); margin-top: 10px; padding-top: 15px; }")
+        diag_layout = QVBoxLayout(diag_group)
+        diag_layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.main_win.tools_view = QTextBrowser()
+        self.main_win.tools_view.setReadOnly(True)
+        self.main_win.tools_view.setFont(QFont("Consolas", 8))
+        self.main_win.tools_view.setStyleSheet("background-color: rgba(20, 20, 25, 0.4); border: none; color: #A0A0A0;")
+        diag_layout.addWidget(self.main_win.tools_view)
+        
+        layout.addWidget(diag_group)
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_metrics)
+        self.timer.start(1000)
+        
+    def refresh_metrics(self):
+        """Starts a background worker to gather heavy metrics asynchronously."""
+        try:
+            if self._worker and self._worker.isRunning():
+                return
+        except RuntimeError:
+            self._worker = None
+        self._worker = _DashboardMetricsWorker(self)
+        self._worker.metrics_ready.connect(self._on_metrics_ready, Qt.ConnectionType.QueuedConnection)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    @Slot(dict)
+    def _on_metrics_ready(self, data):
+        """Processes and updates metrics on the UI thread."""
+        ui_fps = 0.0
+        reactor_dur = 0.0
+        if hasattr(self.main_win, "reactor") and self.main_win.reactor:
+            ui_fps = self.main_win.reactor.ui_fps
+            reactor_dur = self.main_win.reactor.render_time_ms
+
+        # Update cards
+        status_ui = "normal" if ui_fps >= 50.0 else ("warning" if ui_fps >= 30.0 else "critical")
+        self.card_ui_fps.update_metric(ui_fps, status_ui)
+
+        status_react = "normal" if reactor_dur <= 8.0 else ("warning" if reactor_dur <= 16.0 else "critical")
+        self.card_reactor_dur.update_metric(reactor_dur, status_react)
+
+        cam_fps = data["cam_fps"]
+        cam_dur = data["cam_dur"]
+        status_cam = "normal" if cam_fps >= 24.0 else ("warning" if cam_fps >= 10.0 else "critical")
+        self.card_cam_fps.update_metric(cam_fps, status_cam)
+
+        gest_fps = data["gest_fps"]
+        inf_dur = data["inf_dur"]
+        status_gest = "normal" if gest_fps >= 20.0 else ("warning" if gest_fps >= 10.0 else "critical")
+        self.card_gest_fps.update_metric(gest_fps, status_gest)
+
+        cpu = data["cpu"]
+        status_cpu = "normal" if cpu <= 70.0 else ("warning" if cpu <= 90.0 else "critical")
+        self.card_cpu.update_metric(cpu, status_cpu)
+
+        mem = data["mem"]
+        status_mem = "normal" if mem <= 800.0 else ("warning" if mem <= 1500.0 else "critical")
+        self.card_memory.update_metric(mem, status_mem)
+
+        eb_rate = data["eb_rate"]
+        status_eb = "normal" if eb_rate <= 100.0 else "warning"
+        self.card_eventbus.update_metric(eb_rate, status_eb)
+
+        q_len = data["q_len"]
+        status_q = "normal" if q_len <= 1 else ("warning" if q_len <= 3 else "critical")
+        self.card_queue.update_metric(q_len, status_q)
+
+        # Log timing of every subsystem periodically
+        self.logger.info(
+            f"[PERF] UI FPS: {ui_fps:.1f} | "
+            f"Camera FPS: {cam_fps:.1f} (Capture: {cam_dur:.1f} ms) | "
+            f"Gesture FPS: {gest_fps:.1f} (Inference: {inf_dur:.1f} ms) | "
+            f"Reactor: {reactor_dur:.1f} ms | "
+            f"CPU: {cpu:.1f}% | "
+            f"Memory: {mem:.1f} MB | "
+            f"EventBus: {eb_rate:.1f}/s | "
+            f"Queue: {q_len}"
+        )
+
+    def stop_worker(self):
+        """Safely stops any running background dashboard workers."""
+        try:
+            if self._worker and self._worker.isRunning():
+                self._worker.quit()
+                self._worker.wait(1000)
+        except RuntimeError:
+            self._worker = None
 
 
 class UltronActionCard(QPushButton):
@@ -827,9 +1160,189 @@ class UltronProjectPanel(QFrame):
         self.meta_labels["Project Health"].setStyleSheet("color: #00FF00;")
 
 
+# ── Background Worker: gathers diagnostics off the Qt main thread ────────────────
+
+class _DiagnosticsWorker(QThread):
+    """
+    Runs all diagnostic data-gathering off the Qt main thread.
+    Emits html_ready(str) when the report is ready; the main thread slot calls setHtml().
+    """
+    html_ready = Signal(str)
+
+    def __init__(self, core, snapshot: dict):
+        super().__init__()
+        self.core = core
+        self.snapshot = snapshot   # pre-computed Qt-thread values (timer state, etc.)
+
+    def run(self):
+        try:
+            self.html_ready.emit(self._build())
+        except Exception:
+            pass
+
+    def _build(self) -> str:  # noqa: C901
+        import os, time, threading
+        from ultron.core.service_manager import service_manager
+        from ultron.core.event_bus import event_bus
+        from ultron.core.task_manager import task_manager
+        from ultron.hal.hal_manager import get_hal_manager
+        from ultron.core.ai_core import get_ai_core
+        from ultron.core.voice_session_manager import get_voice_session_manager
+        from ultron.core.plugin_loader import get_plugin_loader
+        from ultron.memory import get_memory_manager
+
+        devices = self.snapshot.get("devices", {"microphone": False, "speaker": False, "camera": False})
+        mic_allowed = self.snapshot.get("mic_allowed", False)
+        speaker_allowed = self.snapshot.get("speaker_allowed", False)
+        camera_allowed = self.snapshot.get("camera_allowed", False)
+
+        def _status(is_permitted, is_present, svc_name=None):
+            if not is_permitted:
+                return "<span style='color: orange;'>Disabled</span>"
+            if not is_present:
+                return "<span style='color: gray;'>Offline</span>"
+            if svc_name:
+                svc = service_manager.get_service(svc_name)
+                if svc:
+                    return f"<span style='color: #00FF00;'>{svc.health()}</span>"
+            return "<span style='color: #00FF00;'>Healthy</span>"
+
+        html = "<h3 style='color: #C1121F;'>LIVE OS DIAGNOSTICS</h3>"
+        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
+        html += f"<tr><td>Microphone</td><td>{_status(mic_allowed, devices['microphone'], 'VoiceRecognitionService')}</td></tr>"
+        html += f"<tr><td>Speaker</td><td>{_status(speaker_allowed, devices['speaker'], 'SpeechService')}</td></tr>"
+        html += f"<tr><td>Camera</td><td>{_status(camera_allowed, devices['camera'])}</td></tr>"
+
+        for svc_name, label in [("VoiceRecognitionService", "Voice Recognition"), ("WakeService", "Wake Engine")]:
+            svc = service_manager.get_service(svc_name)
+            stat = f"<span style='color: #00FF00;'>{svc.health()}</span>" if svc else "<span style='color: gray;'>Offline</span>"
+            html += f"<tr><td>{label}</td><td>{stat}</td></tr>"
+
+        html += "<tr><td>SQLite Database</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
+        html += "<tr><td>Memory Engine</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
+        html += "<tr><td>Cognitive Core</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
+
+        skills = self.core.get_module("skills_registry")
+        skills_stat = f"<span style='color: #00FF00;'>{skills.health()['status'].title()}</span>" if skills else "<span style='color: gray;'>Offline</span>"
+        html += f"<tr><td>Skill Registry</td><td>{skills_stat}</td></tr>"
+
+        active_tasks = [t for t in task_manager.list_tasks() if t["status"] in ["Running", "Queued"]]
+        exec_stat = f"<span style='color: orange;'>Running ({len(active_tasks)} tasks)</span>" if active_tasks else "<span style='color: #00FF00;'>Standing By</span>"
+        html += f"<tr><td>Executor</td><td>{exec_stat}</td></tr>"
+        html += "</table>"
+
+        mgr = get_voice_session_manager()
+        voice_state = mgr.state.name if mgr else "SLEEPING"
+        wake_detector = service_manager.get_service("WakeDetectorService")
+        wake_enabled = "Yes" if (wake_detector and wake_detector.active) else "No"
+
+        engine_srv = service_manager.get_service("VoiceEngineService")
+        microphone = engine_srv.diagnostics.get("current_microphone", "GENERAL WEBCAM") if engine_srv else "GENERAL WEBCAM"
+        rec_provider = (engine_srv.reco_provider_name or "VOSK").upper() if engine_srv else "VOSK"
+        wake_provider = (engine_srv.wake_provider_name or "VOSK").upper() if engine_srv else "VOSK"
+
+        reco_threads = [t for t in threading.enumerate() if "Recognition" in t.name or "Voice" in t.name]
+        tts_threads  = [t for t in threading.enumerate() if "tts" in t.name.lower() or "pyttsx" in t.name.lower()]
+
+        ai = get_ai_core()
+        ai_thread_status = "Running" if (ai and ai.queue.worker_thread and ai.queue.worker_thread.is_alive()) else "Offline"
+        speech_thread    = "Running" if (tts_threads or (engine_srv and engine_srv.active_tts)) else "Offline"
+
+        try:
+            import psutil
+            proc = psutil.Process(os.getpid())
+            ram_usage = f"{proc.memory_info().rss / 1048576:.1f} MB"
+            cpu_usage = f"{psutil.cpu_percent(interval=None)}%"
+        except Exception:
+            ram_usage = cpu_usage = "Unknown"
+
+        convo_id    = "-"
+        last_wake_time = "-"
+        last_command   = "-"
+        avg_rec_lat    = "0 ms"
+        avg_res_lat    = "0 ms"
+        avg_ai_time    = "0 ms"
+        wake_count = cmds_proc = resp_spk = 0
+
+        if mgr:
+            convo_id = mgr.convo_id
+            if mgr.last_wake_time > 0:
+                last_wake_time = time.strftime('%H:%M:%S', time.localtime(mgr.last_wake_time))
+            last_command  = mgr.last_command
+            avg_rec_lat   = f"{mgr.avg_recognition_latency * 1000:.0f} ms"
+            avg_res_lat   = f"{mgr.avg_response_latency  * 1000:.0f} ms"
+            avg_ai_time   = f"{mgr.avg_ai_time           * 1000:.0f} ms"
+            wake_count    = mgr.wake_count
+            cmds_proc     = mgr.commands_processed
+            resp_spk      = mgr.responses_spoken
+
+        sub_count  = event_bus.get_subscriber_count()
+        queue_len  = ai.queue.get_count() if ai else 0
+
+        import main as _main
+        boot_stage = getattr(_main, "current_boot_stage", "BOOT 09: Boot complete")
+        p_loader   = get_plugin_loader()
+        plugin_status = f"Active ({len(p_loader.loaded_plugins)} plugins)" if (p_loader and p_loader.loaded_plugins) else "Offline"
+        mem_status = "Loaded (SQLite)" if get_memory_manager() else "Offline"
+        services_list = ", ".join(service_manager.list_services())
+
+        # Values that were read on the main thread to avoid QTimer cross-thread calls
+        timer_active = self.snapshot.get("timer_active", "-")
+        sec_rem      = self.snapshot.get("sec_rem",      "-")
+
+        html += "<br/><b>Architectural Diagnostics:</b><br/>"
+        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
+        for label, val in [
+            ("Current State", voice_state), ("Wake Enabled", wake_enabled),
+            ("Wake Provider", wake_provider), ("Recognition Provider", rec_provider),
+            ("Current Microphone", microphone), ("Speech Thread", speech_thread),
+            ("Queue Thread", ai_thread_status), ("EventBus Queue", queue_len),
+            ("EventBus Subscribers", sub_count), ("Boot Stage", boot_stage),
+            ("Plugin Status", plugin_status), ("Memory Status", mem_status),
+            ("Conversation ID", convo_id), ("Session Timer", timer_active),
+            ("Session Timer Remaining", sec_rem), ("Wake Count", wake_count),
+            ("Commands Processed", cmds_proc), ("Responses Spoken", resp_spk),
+            ("Avg Recognition Time", avg_rec_lat), ("Avg AI Time", avg_ai_time),
+            ("Avg Response Time", avg_res_lat), ("Memory Usage", ram_usage),
+            ("CPU Usage", cpu_usage), ("Registered Services", services_list),
+            ("Application Version", "1.0.0"),
+        ]:
+            html += f"<tr><td>{label}</td><td><span style='color: #00FF00;'>{val}</span></td></tr>"
+        html += "</table>"
+
+        # Voice Recognition Forensics
+        active_rec = engine_srv.active_recognizer if engine_srv else None
+        rec_alive  = "Yes" if (active_rec and active_rec.thread and active_rec.thread.is_alive()) else "No"
+        rec_run    = "Yes" if (active_rec and active_rec.active) else "No"
+        cb_count   = getattr(active_rec, "audio_callback_count", getattr(active_rec, "chunks_received", 0)) if active_rec else 0
+        dropped    = getattr(active_rec, "dropped_buffers", 0) if active_rec else 0
+
+        html += "<br/><b>Voice Recognition Forensics:</b><br/>"
+        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
+        for label, val in [
+            ("Recognition Thread Alive", rec_alive), ("Recognition Loop Running", rec_run),
+            ("Audio Callback Count", cb_count),
+            ("Speech Events Published",  event_bus.get_publish_count("SPEECH_RECOGNIZED")),
+            ("Wake Events Published",    event_bus.get_publish_count("WAKE_DETECTED")),
+            ("Commands Executed",        event_bus.get_publish_count("COMMAND_RECEIVED")),
+            ("Dropped Buffers", dropped), ("Current Voice State", voice_state),
+        ]:
+            html += f"<tr><td>{label}</td><td><span style='color: #00FF00;'>{val}</span></td></tr>"
+        html += "</table>"
+
+        html += "<br/><b>Task History:</b><br/>"
+        for t in reversed(task_manager.list_tasks()[-5:]):
+            color = "#00FF00" if t["status"] == "Completed" else "#C1121F" if t["status"] == "Failed" else "orange"
+            html += f"Task: <b>{t['description'][:30]}</b> | Status: <b style='color: {color};'>{t['status'].upper()}</b><br/>"
+
+        return html
+
+
 # ── Main Window Dashboard ─────────────────────────────────────────────────────
 
 class UltronMainWindow(QMainWindow):
+    event_signal = Signal(object)
+
     def __init__(self, core_system, memory_manager=None, voice_provider=None):
         super().__init__()
         self.core = core_system
@@ -843,23 +1356,23 @@ class UltronMainWindow(QMainWindow):
         self._init_ui()
         self.lock_ui()
 
-        # Event Bus subscriptions
-        event_bus.subscribe("STATE_CHANGED", self.on_state_changed)
-        event_bus.subscribe("VOICE_STATE_CHANGED", self.on_voice_state_changed)
-        event_bus.subscribe("QUEUE_COUNT_CHANGED", self.on_queue_count_changed)
-        event_bus.subscribe("WAKE_TRIGGERED", self.on_wake_triggered)
-        event_bus.subscribe("SLEEP_TRIGGERED", self.on_sleep_triggered)
-        event_bus.subscribe("VOICE_DIAGNOSTICS_UPDATE", self.on_voice_diagnostics_update)
-        event_bus.subscribe("NOTIFICATION", self.on_notification_event)
-        event_bus.subscribe("WARNING_OCCURRED", self.on_warning_event)
-        event_bus.subscribe("ERROR_OCCURRED", self.on_error_event)
-        event_bus.subscribe("VOSK_MODEL_MISSING", self.on_vosk_model_missing)
-        event_bus.subscribe("VOLUME_LEVEL_CHANGED", self.on_volume_level_changed)
-        event_bus.subscribe("AI_RESPONSE_READY", self.on_ai_response_ready)
+        # Connect thread-safe generic event router
+        self.event_signal.connect(self._handle_queued_event, Qt.ConnectionType.QueuedConnection)
 
+        # Event Bus subscriptions routed through the custom signal to GUI main thread
+        for et in [
+            "STATE_CHANGED", "VOICE_STATE_CHANGED", "QUEUE_COUNT_CHANGED",
+            "WAKE_TRIGGERED", "SLEEP_TRIGGERED", "VOICE_DIAGNOSTICS_UPDATE",
+            "NOTIFICATION", "WARNING_OCCURRED", "ERROR_OCCURRED",
+            "VOSK_MODEL_MISSING", "VOLUME_LEVEL_CHANGED", "AI_RESPONSE_READY",
+            "HiddenItemAdded", "HiddenItemRestored", "HiddenItemOpened", "HiddenItemMissing"
+        ]:
+            event_bus.subscribe(et, self._event_bus_route_callback)
+
+        self._diag_worker = None
         self.diag_timer = QTimer(self)
-        self.diag_timer.timeout.connect(self.refresh_diagnostics)
-        self.diag_timer.start(1000)
+        self.diag_timer.timeout.connect(self._start_diag_worker)
+        self.diag_timer.start(2000)  # 2 s is plenty for a non-blocking background gather
 
         if self.memory:
             self.load_user_profile()
@@ -948,6 +1461,7 @@ class UltronMainWindow(QMainWindow):
             ("PROJECTS", "Projects", "\u25A6"),
             ("TOOLS", "Diagnostics Active", "\u2692"),
             ("TERMINAL", "Developer Prompt", "\uFF1E"),
+            ("HIDDEN ITEMS", "Vault Manager", "\ud83d\udd12"),
             ("SETTINGS", "System Settings", "\u2699")
         ]
         for idx, (title, desc, icon) in enumerate(nav_configs):
@@ -1023,6 +1537,7 @@ class UltronMainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.create_projects_page())
         self.stacked_widget.addWidget(self.create_tools_page())
         self.stacked_widget.addWidget(QWidget()) # placeholder for Terminal button routing
+        self.stacked_widget.addWidget(self.create_hidden_items_page())
         self.stacked_widget.addWidget(self.create_settings_page())
 
         self.splitter.addWidget(self.stacked_widget)
@@ -1059,21 +1574,16 @@ class UltronMainWindow(QMainWindow):
         self.active_status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         center_hub.addWidget(self.active_status_lbl)
 
-        # Waveform + Radar background circles container
+        # Reactor Visualizer container
         wave_container = QWidget()
-        wave_container.setMinimumHeight(240)
+        wave_container.setMinimumHeight(380)
         
-        self.radar = safe_create_widget("UltronRadarWidget", wave_container)
-        self.waveform = safe_create_widget("UltronWaveformWidget", wave_container)
+        self.reactor = safe_create_widget("UltronReactorWidget", wave_container)
+        self.reactor.setGeometry(0, 0, 480, 380)
         
-        # Position waveform directly over radar
-        self.radar.setGeometry(0, 0, 480, 240)
-        self.waveform.setGeometry(0, 0, 480, 240)
-        
-        def resize_waves(event):
-            self.radar.resize(event.size())
-            self.waveform.resize(event.size())
-        wave_container.resizeEvent = resize_waves
+        def resize_reactor(event):
+            self.reactor.resize(event.size())
+        wave_container.resizeEvent = resize_reactor
         
         center_hub.addWidget(wave_container)
 
@@ -1201,6 +1711,13 @@ class UltronMainWindow(QMainWindow):
         right_column.addWidget(self.thought_stream)
         right_column.addWidget(self.memory_status)
         right_column.addWidget(self.project_panel)
+        
+        self.camera_preview = safe_create_widget("UltronCameraPreviewWidget")
+        right_column.addWidget(self.camera_preview)
+        hal = get_hal_manager()
+        if not (hal.is_allowed("camera") if hal else False):
+            self.camera_preview.hide()
+            
         main_layout.addLayout(right_column, 3)
 
         return widget
@@ -1211,14 +1728,12 @@ class UltronMainWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         
         lbl = QLabel("UME STORAGE STATUS")
-        lbl.setFont(QFont("Inter", 14, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #C1121F;")
+        lbl.setObjectName("TitleLabel")
         layout.addWidget(lbl)
         
         self.memory_view = QTextEdit()
         self.memory_view.setReadOnly(True)
         self.memory_view.setFont(QFont("Consolas", 10))
-        self.memory_view.setStyleSheet("background-color: #111111; border: 1px solid rgba(255,255,255,0.05); color: #F5F5F5;")
         layout.addWidget(self.memory_view)
         return widget
 
@@ -1228,33 +1743,18 @@ class UltronMainWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         
         lbl = QLabel("PROJECT INTELLIGENCE")
-        lbl.setFont(QFont("Inter", 14, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #C1121F;")
+        lbl.setObjectName("TitleLabel")
         layout.addWidget(lbl)
         
         self.projects_view = QTextEdit()
         self.projects_view.setReadOnly(True)
         self.projects_view.setFont(QFont("Consolas", 10))
-        self.projects_view.setStyleSheet("background-color: #111111; border: 1px solid rgba(255,255,255,0.05); color: #F5F5F5;")
         layout.addWidget(self.projects_view)
         return widget
 
     def create_tools_page(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(20, 20, 20, 20)
-        
-        lbl = QLabel("SYSTEM DIAGNOSTICS & CONTROLS")
-        lbl.setFont(QFont("Inter", 14, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #C1121F;")
-        layout.addWidget(lbl)
-        
-        self.tools_view = QTextEdit()
-        self.tools_view.setReadOnly(True)
-        self.tools_view.setFont(QFont("Consolas", 10))
-        self.tools_view.setStyleSheet("background-color: #111111; border: 1px solid rgba(255,255,255,0.05); color: #F5F5F5;")
-        layout.addWidget(self.tools_view)
-        return widget
+        self.perf_dashboard = UltronPerformanceDashboard(self)
+        return self.perf_dashboard
 
     def create_settings_page(self) -> QWidget:
         main_widget = QWidget()
@@ -1337,6 +1837,27 @@ class UltronMainWindow(QMainWindow):
         self.cam_toggle.setChecked(hal.is_allowed("camera") if hal else False)
         self.cam_toggle.stateChanged.connect(self.on_cam_toggle)
         layout.addWidget(self.cam_toggle)
+
+        self.cam_debug_toggle = QCheckBox("Enable Vision Debug Overlay")
+        self.cam_debug_toggle.setFont(QFont("Inter", 10))
+        self.cam_debug_toggle.setStyleSheet("color: #F5F5F5; padding: 3px;")
+        
+        initial_debug = False
+        try:
+            from ultron.memory import get_memory_manager
+            mem = get_memory_manager()
+            if mem:
+                records = mem.list_records("provider_settings", limit=100)
+                for r in records:
+                    if r["title"] == "vision_debug_overlay":
+                        initial_debug = r["content"].lower() == "true"
+                        break
+        except Exception:
+            pass
+            
+        self.cam_debug_toggle.setChecked(initial_debug)
+        self.cam_debug_toggle.stateChanged.connect(self.on_cam_debug_toggle)
+        layout.addWidget(self.cam_debug_toggle)
         
         # Subsystem settings
         selectors_box = QGroupBox("Subsystem Providers & Settings")
@@ -1691,93 +2212,118 @@ class UltronMainWindow(QMainWindow):
 
     # ── State listeners and handlers ──
 
+    # ── Thread-Safe EventBus Routing ──
+
+    def _event_bus_route_callback(self, event):
+        """Dispatched on worker threads — safely routes EventBus events to the main thread."""
+        self.event_signal.emit(event)
+
+    @Slot(object)
+    def _handle_queued_event(self, event):
+        """Executed on the Qt main thread — dispatches to standard handlers."""
+        et = event.event_type
+        if et == "STATE_CHANGED":
+            self.on_state_changed(event)
+        elif et == "VOICE_STATE_CHANGED":
+            self.on_voice_state_changed(event)
+        elif et == "QUEUE_COUNT_CHANGED":
+            self.on_queue_count_changed(event)
+        elif et == "WAKE_TRIGGERED":
+            self.on_wake_triggered(event)
+        elif et == "SLEEP_TRIGGERED":
+            self.on_sleep_triggered(event)
+        elif et == "VOICE_DIAGNOSTICS_UPDATE":
+            self.on_voice_diagnostics_update(event)
+        elif et == "NOTIFICATION":
+            self.on_notification_event(event)
+        elif et == "WARNING_OCCURRED":
+            self.on_warning_event(event)
+        elif et == "ERROR_OCCURRED":
+            self.on_error_event(event)
+        elif et == "VOSK_MODEL_MISSING":
+            self.on_vosk_model_missing(event)
+        elif et == "VOLUME_LEVEL_CHANGED":
+            self.on_volume_level_changed(event)
+        elif et == "AI_RESPONSE_READY":
+            self.on_ai_response_ready(event)
+        elif et in ["HiddenItemAdded", "HiddenItemRestored", "HiddenItemOpened", "HiddenItemMissing"]:
+            self.refresh_hidden_items_view()
+
+    # ── State listeners and handlers (Main Thread Only) ──
+
     @Slot(object)
     def on_state_changed(self, event):
         state = event.payload.get("state", "Sleeping")
-        def update_ui():
-            self.floating_widget.set_state(state)
-            self.waveform.set_state(state)
-            self.radar.set_state(state)
-            self.thought_stream.set_voice_state(state)
-            
-            # Animate mic button
-            if state.lower() == "listening":
-                self.mic_btn.set_state("listening")
-                self.active_status_lbl.setText("Listening...")
-            elif state.lower() == "thinking":
-                self.mic_btn.set_state("processing")
-                self.active_status_lbl.setText("Thinking...")
-            elif state.lower() == "speaking":
-                self.mic_btn.set_state("idle")
-                self.active_status_lbl.setText("Speaking...")
-            else:
-                self.mic_btn.set_state("idle")
-                self.active_status_lbl.setText("Sleeping...")
-                
-        if threading.current_thread().name == "MainThread":
-            update_ui()
+        self.floating_widget.set_state(state)
+        self.reactor.set_state(state)
+        self.thought_stream.set_voice_state(state)
+        
+        # Animate mic button
+        if state.lower() == "listening":
+            self.mic_btn.set_state("listening")
+            self.active_status_lbl.setText("Listening...")
+        elif state.lower() == "thinking":
+            self.mic_btn.set_state("processing")
+            self.active_status_lbl.setText("Thinking...")
+        elif state.lower() == "speaking":
+            self.mic_btn.set_state("idle")
+            self.active_status_lbl.setText("Speaking...")
         else:
-            QTimer.singleShot(0, update_ui)
+            self.mic_btn.set_state("idle")
+            self.active_status_lbl.setText("Sleeping...")
 
     @Slot(object)
     def on_voice_state_changed(self, event):
         voice_state = event.payload.get("state", "SLEEPING")
         self.current_voice_state = voice_state
         
-        def update_ui():
-            visual_map = {
-                "BOOTING": "Sleeping",
-                "INITIALIZING": "Thinking",
-                "READY": "Sleeping",
-                "SLEEPING": "Sleeping",
-                "WAKING": "Speaking",
-                "GREETING": "Speaking",
-                "LISTENING": "Listening",
-                "PROCESSING": "Thinking",
-                "RESPONDING": "Speaking",
-                "TIMEOUT": "Speaking",
-                "ERROR": "Error",
-                "SHUTDOWN": "Sleeping"
-            }
-            visual_state = visual_map.get(voice_state, "Sleeping")
-            self.floating_widget.set_state(visual_state)
-            self.waveform.set_state(visual_state)
-            self.radar.set_state(visual_state)
-            self.thought_stream.set_voice_state(voice_state)
-            
-            # Set dynamic Active Listening status texts
-            if voice_state.upper() == "LISTENING":
-                self.mic_btn.set_state("listening")
-                self.active_status_lbl.setText("Listening...")
-            elif voice_state.upper() in ["PROCESSING", "INITIALIZING", "THINKING"]:
-                self.mic_btn.set_state("processing")
-                self.active_status_lbl.setText("Thinking...")
-            elif voice_state.upper() in ["RESPONDING", "GREETING", "WAKING", "SPEAKING"]:
-                self.mic_btn.set_state("idle")
-                self.active_status_lbl.setText("Speaking...")
-            else:
-                self.mic_btn.set_state("idle")
-                self.active_status_lbl.setText("Sleeping...")
-
-            badge_text = "Sleeping"
-            if voice_state.upper() == "LISTENING":
-                badge_text = "Listening"
-            elif voice_state.upper() in ["PROCESSING", "INITIALIZING"]:
-                badge_text = "Thinking"
-            elif voice_state.upper() in ["RESPONDING", "GREETING", "WAKING"]:
-                badge_text = "Speaking"
-            
-            self.user_badge.setText(badge_text)
-            
-            if voice_state in ["BOOTING", "INITIALIZING"]:
-                self.lock_ui()
-            else:
-                self.unlock_ui()
-                
-        if threading.current_thread().name == "MainThread":
-            update_ui()
+        visual_map = {
+            "BOOTING": "Sleeping",
+            "INITIALIZING": "Thinking",
+            "READY": "Sleeping",
+            "SLEEPING": "Sleeping",
+            "WAKING": "Speaking",
+            "GREETING": "Speaking",
+            "LISTENING": "Listening",
+            "PROCESSING": "Thinking",
+            "RESPONDING": "Speaking",
+            "TIMEOUT": "Speaking",
+            "ERROR": "Error",
+            "SHUTDOWN": "Sleeping"
+        }
+        visual_state = visual_map.get(voice_state, "Sleeping")
+        self.floating_widget.set_state(visual_state)
+        self.reactor.set_state(visual_state)
+        self.thought_stream.set_voice_state(voice_state)
+        
+        # Set dynamic Active Listening status texts
+        if voice_state.upper() == "LISTENING":
+            self.mic_btn.set_state("listening")
+            self.active_status_lbl.setText("Listening...")
+        elif voice_state.upper() in ["PROCESSING", "INITIALIZING", "THINKING"]:
+            self.mic_btn.set_state("processing")
+            self.active_status_lbl.setText("Thinking...")
+        elif voice_state.upper() in ["RESPONDING", "GREETING", "WAKING", "SPEAKING"]:
+            self.mic_btn.set_state("idle")
+            self.active_status_lbl.setText("Speaking...")
         else:
-            QTimer.singleShot(0, update_ui)
+            self.mic_btn.set_state("idle")
+            self.active_status_lbl.setText("Sleeping...")
+
+        badge_text = "Sleeping"
+        if voice_state.upper() == "LISTENING":
+            badge_text = "Listening"
+        elif voice_state.upper() in ["PROCESSING", "INITIALIZING"]:
+            badge_text = "Thinking"
+        elif voice_state.upper() in ["RESPONDING", "GREETING", "WAKING"]:
+            badge_text = "Speaking"
+        
+        self.user_badge.setText(badge_text)
+        
+        if voice_state in ["BOOTING", "INITIALIZING"]:
+            self.lock_ui()
+        else:
+            self.unlock_ui()
 
     @Slot(object)
     def on_queue_count_changed(self, event):
@@ -1785,19 +2331,16 @@ class UltronMainWindow(QMainWindow):
 
     @Slot(object)
     def on_wake_triggered(self, event):
-        msg = event.payload.get("message")
-        # Keep static greeting structure clean
         pass
 
     @Slot(object)
     def on_sleep_triggered(self, event):
-        msg = event.payload.get("message")
         pass
 
     @Slot(object)
     def on_voice_diagnostics_update(self, event):
         data = event.payload
-        QTimer.singleShot(0, lambda: self.update_voice_diagnostics_ui(data))
+        self.update_voice_diagnostics_ui(data)
 
     def update_voice_diagnostics_ui(self, data):
         if not hasattr(self, "lbl_reco_prov"):
@@ -1896,26 +2439,46 @@ class UltronMainWindow(QMainWindow):
         hal = get_hal_manager()
         if hal:
             hal.save_permission("microphone", allowed)
-        if allowed:
-            service_manager.start_service("VoiceRecognitionService")
-        else:
-            service_manager.stop_service("VoiceRecognitionService")
+        svc = "VoiceRecognitionService"
+        QTimer.singleShot(0, lambda: service_manager.start_service(svc) if allowed else service_manager.stop_service(svc))
 
     def on_spk_toggle(self, state):
         allowed = (state == 2)
         hal = get_hal_manager()
         if hal:
             hal.save_permission("speaker", allowed)
-        if allowed:
-            service_manager.start_service("SpeechService")
-        else:
-            service_manager.stop_service("SpeechService")
+        svc = "SpeechService"
+        QTimer.singleShot(0, lambda: service_manager.start_service(svc) if allowed else service_manager.stop_service(svc))
 
     def on_cam_toggle(self, state):
         allowed = (state == 2)
         hal = get_hal_manager()
         if hal:
             hal.save_permission("camera", allowed)
+        if allowed:
+            QTimer.singleShot(0, lambda: service_manager.start_service("VisionService"))
+            if hasattr(self, "camera_preview"):
+                self.camera_preview.show()
+        else:
+            QTimer.singleShot(0, lambda: service_manager.stop_service("VisionService"))
+            if hasattr(self, "camera_preview"):
+                self.camera_preview.hide()
+
+    def on_cam_debug_toggle(self, state):
+        allowed = (state == 2)
+        try:
+            from ultron.memory import get_memory_manager
+            mem = get_memory_manager()
+            if mem:
+                records = mem.list_records("provider_settings", limit=100)
+                rec = next((r for r in records if r["title"] == "vision_debug_overlay"), None)
+                if rec:
+                    mem.update_record("provider_settings", rec["id"], {"content": str(allowed)})
+                else:
+                    mem.create_record("provider_settings", title="vision_debug_overlay", content=str(allowed))
+        except Exception:
+            pass
+        event_bus.publish("VISION_DEBUG_TOGGLED", {"enabled": allowed})
 
     def on_reco_changed(self, text):
         self.save_voice_config("recognizer", text)
@@ -1961,7 +2524,7 @@ class UltronMainWindow(QMainWindow):
             return
         level = event.payload.get("level", 0.0)
         percent = min(100, int((level / 4000.0) * 100))
-        QTimer.singleShot(0, lambda: self.volume_meter.setValue(percent))
+        self.volume_meter.setValue(percent)
 
     def on_wake_phrase_changed(self, text):
         self.save_voice_config("wake_phrase", text)
@@ -1974,19 +2537,22 @@ class UltronMainWindow(QMainWindow):
         msg = event.payload.get("message", "-")
         title = event.payload.get("title", "-")
         notif_str = f"Last Notification: {title} - {msg}"
-        QTimer.singleShot(0, lambda: self.lbl_last_notif.setText(notif_str) if hasattr(self, "lbl_last_notif") else None)
+        if hasattr(self, "lbl_last_notif"):
+            self.lbl_last_notif.setText(notif_str)
 
     @Slot(object)
     def on_warning_event(self, event):
         msg = event.payload.get("message", "-")
         warn_str = f"Last Warning: <span style='color: yellow;'>{msg}</span>"
-        QTimer.singleShot(0, lambda: self.lbl_last_warn.setText(warn_str) if hasattr(self, "lbl_last_warn") else None)
+        if hasattr(self, "lbl_last_warn"):
+            self.lbl_last_warn.setText(warn_str)
 
     @Slot(object)
     def on_error_event(self, event):
         msg = event.payload.get("message", "-")
         err_str = f"Last Error: <span style='color: #C1121F;'>{msg}</span>"
-        QTimer.singleShot(0, lambda: self.lbl_last_err.setText(err_str) if hasattr(self, "lbl_last_err") else None)
+        if hasattr(self, "lbl_last_err"):
+            self.lbl_last_err.setText(err_str)
 
     @Slot(str)
     def on_profile_changed(self, profile_name):
@@ -2060,204 +2626,51 @@ class UltronMainWindow(QMainWindow):
         self.refresh_settings_view()
 
     def refresh_diagnostics(self):
+        """Public alias kept for compatibility — delegates to the background worker."""
+        self._start_diag_worker()
+
+    def _start_diag_worker(self):
+        """Starts a one-shot background thread to gather diagnostics. Skips if one is already running."""
+        try:
+            if self._diag_worker and self._diag_worker.isRunning():
+                return
+        except RuntimeError:
+            self._diag_worker = None
+        from ultron.core.voice_session_manager import get_voice_session_manager
+        mgr = get_voice_session_manager()
+        # Read Qt-thread-only values HERE before handing off to the worker
+        timer_active = "Active" if (mgr and mgr.session_timer.isActive()) else "Inactive"
+        rem_ms = mgr.session_timer.remainingTime() if mgr else -1
+        
+        # Pre-fetch hardware devices and permissions safely on Qt main thread
         hal = get_hal_manager()
         devices = hal.check_devices() if hal else {"microphone": False, "speaker": False, "camera": False}
-        
-        def get_status_html(name, is_permitted, is_present, service_name=None):
-            if not is_permitted:
-                return "<span style='color: orange;'>Disabled</span>"
-            if not is_present:
-                return "<span style='color: gray;'>Offline</span>"
-            if service_name:
-                service = service_manager.get_service(service_name)
-                if service:
-                    return f"<span style='color: #00FF00;'>{service.health()}</span>"
-            return "<span style='color: #00FF00;'>Healthy</span>"
+        mic_allowed = hal.is_allowed('microphone') if hal else False
+        speaker_allowed = hal.is_allowed('speaker') if hal else False
+        camera_allowed = hal.is_allowed('camera') if hal else False
 
-        html = "<h3 style='color: #C1121F;'>LIVE OS DIAGNOSTICS</h3>"
-        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
-        
-        mic_stat = get_status_html("Microphone", hal.is_allowed("microphone") if hal else False, devices["microphone"], "VoiceRecognitionService")
-        html += f"<tr><td>Microphone</td><td>{mic_stat}</td></tr>"
-        
-        spk_stat = get_status_html("Speaker", hal.is_allowed("speaker") if hal else False, devices["speaker"], "SpeechService")
-        html += f"<tr><td>Speaker</td><td>{spk_stat}</td></tr>"
-        
-        cam_stat = get_status_html("Camera", hal.is_allowed("camera") if hal else False, devices["camera"])
-        html += f"<tr><td>Camera</td><td>{cam_stat}</td></tr>"
-        
-        reco_service = service_manager.get_service("VoiceRecognitionService")
-        reco_stat = f"<span style='color: #00FF00;'>{reco_service.health()}</span>" if reco_service else "<span style='color: gray;'>Offline</span>"
-        html += f"<tr><td>Voice Recognition</td><td>{reco_stat}</td></tr>"
-        
-        wake_service = service_manager.get_service("WakeService")
-        wake_stat = f"<span style='color: #00FF00;'>{wake_service.health()}</span>" if wake_service else "<span style='color: gray;'>Offline</span>"
-        html += f"<tr><td>Wake Engine</td><td>{wake_stat}</td></tr>"
-        
-        html += "<tr><td>SQLite Database</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
-        html += "<tr><td>Memory Engine</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
-        html += "<tr><td>Cognitive Core</td><td><span style='color: #00FF00;'>Healthy</span></td></tr>"
-        skills = self.core.get_module("skills_registry")
-        skills_stat = f"<span style='color: #00FF00;'>{skills.health()['status'].title()}</span>" if skills else "<span style='color: gray;'>Offline</span>"
-        html += f"<tr><td>Skill Registry</td><td>{skills_stat}</td></tr>"
-        
-        active_tasks = [t for t in task_manager.list_tasks() if t["status"] in ["Running", "Queued"]]
-        exec_stat = f"<span style='color: orange;'>Running ({len(active_tasks)} tasks)</span>" if active_tasks else "<span style='color: #00FF00;'>Standing By</span>"
-        html += f"<tr><td>Executor</td><td>{exec_stat}</td></tr>"
-        
-        html += "</table>"
-        
-        # Architectural details
-        from ultron.core.voice_session_manager import get_voice_session_manager, VoiceState
-        mgr = get_voice_session_manager()
-        voice_state = mgr.state.name if mgr else "SLEEPING"
-        
-        wake_detector = service_manager.get_service("WakeDetectorService")
-        wake_enabled = "Yes" if (wake_detector and wake_detector.active) else "No"
-        
-        engine_srv = service_manager.get_service("VoiceEngineService")
-        microphone = "GENERAL WEBCAM"
-        rec_provider = "VOSK"
-        wake_provider = "VOSK"
-        if engine_srv:
-            microphone = engine_srv.diagnostics.get("current_microphone", "GENERAL WEBCAM")
-            rec_provider = engine_srv.reco_provider_name.upper() if engine_srv.reco_provider_name else "VOSK"
-            wake_provider = engine_srv.wake_provider_name.upper() if engine_srv.wake_provider_name else "VOSK"
-            
-        reco_threads = [t for t in threading.enumerate() if "Recognition" in t.name or "Voice" in t.name]
-        wake_threads = [t for t in threading.enumerate() if "Wake" in t.name]
-        tts_threads = [t for t in threading.enumerate() if "tts" in t.name.lower() or "pyttsx" in t.name.lower()]
-        
-        from ultron.core.ai_core import get_ai_core
-        ai = get_ai_core()
-        ai_thread_status = "Running" if (ai and ai.queue.worker_thread and ai.queue.worker_thread.is_alive()) else "Offline"
-        
-        recognition_thread = "Running" if reco_threads else "Offline"
-        wake_thread = "Running" if wake_threads else "Offline"
-        speech_thread = "Running" if (tts_threads or (engine_srv and engine_srv.active_tts)) else "Offline"
-        
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            ram_usage = f"{process.memory_info().rss / 1024 / 1024:.1f} MB"
-            cpu_usage = f"{psutil.cpu_percent()}%"
-        except Exception:
-            ram_usage = "Unknown"
-            cpu_usage = "Unknown"
- 
-        services_list = ", ".join(service_manager.list_services())
-        app_version = "1.0.0"
-        
-        timer_active = "Inactive"
-        sec_rem = "-"
-        convo_id = "-"
-        last_wake_time = "-"
-        last_command = "-"
-        last_response = "-"
-        avg_rec_lat = "0 ms"
-        avg_res_lat = "0 ms"
-        avg_ai_time = "0 ms"
-        wake_count = 0
-        cmds_proc = 0
-        resp_spk = 0
-        
-        if mgr:
-            timer_active = "Active" if mgr.session_timer.isActive() else "Inactive"
-            rem_ms = mgr.session_timer.remainingTime()
-            sec_rem = f"{rem_ms / 1000.0:.1f} s" if rem_ms >= 0 else "-"
-            convo_id = mgr.convo_id
-            if mgr.last_wake_time > 0:
-                last_wake_time = time.strftime('%H:%M:%S', time.localtime(mgr.last_wake_time))
-            last_command = mgr.last_command
-            last_response = mgr.last_response
-            avg_rec_lat = f"{mgr.avg_recognition_latency * 1000:.0f} ms"
-            avg_res_lat = f"{mgr.avg_response_latency * 1000:.0f} ms"
-            avg_ai_time = f"{mgr.avg_ai_time * 1000:.0f} ms"
-            wake_count = mgr.wake_count
-            cmds_proc = mgr.commands_processed
-            resp_spk = mgr.responses_spoken
-            
-        sub_count = 0
-        with event_bus._lock:
-            for subs in event_bus._subscribers.values():
-                sub_count += len(subs)
-                
-        queue_len = ai.queue.get_count() if ai else 0
-        
-        import main
-        boot_stage = getattr(main, "current_boot_stage", "BOOT 09: Boot complete")
-        stage_b_complete = "Yes" if (mgr and mgr.voice is not None) else "No"
-        
-        from ultron.core.plugin_loader import get_plugin_loader
-        p_loader = get_plugin_loader()
-        plugin_status = f"Active ({len(p_loader.loaded_plugins)} plugins)" if (p_loader and p_loader.loaded_plugins) else "Offline"
-        
-        from ultron.memory import get_memory_manager
-        mem = get_memory_manager()
-        memory_status = "Loaded (SQLite)" if mem else "Offline"
-        
-        html += "<br/><b>Architectural Diagnostics:</b><br/>"
-        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
-        html += f"<tr><td>Current State</td><td><span style='color: #00FF00;'>{voice_state}</span></td></tr>"
-        html += f"<tr><td>Wake Enabled</td><td><span style='color: #00FF00;'>{wake_enabled}</span></td></tr>"
-        html += f"<tr><td>Wake Provider</td><td><span style='color: #00FF00;'>{wake_provider}</span></td></tr>"
-        html += f"<tr><td>Recognition Provider</td><td><span style='color: #00FF00;'>{rec_provider}</span></td></tr>"
-        html += f"<tr><td>Current Microphone</td><td><span style='color: #00FF00;'>{microphone}</span></td></tr>"
-        html += f"<tr><td>Speech Thread</td><td><span style='color: #00FF00;'>{speech_thread}</span></td></tr>"
-        html += f"<tr><td>Queue Thread</td><td><span style='color: #00FF00;'>{ai_thread_status}</span></td></tr>"
-        html += f"<tr><td>EventBus Queue</td><td><span style='color: #00FF00;'>{queue_len}</span></td></tr>"
-        html += f"<tr><td>EventBus Subscribers</td><td><span style='color: #00FF00;'>{sub_count}</span></td></tr>"
-        html += f"<tr><td>Boot Stage</td><td><span style='color: #00FF00;'>{boot_stage}</span></td></tr>"
-        html += f"<tr><td>Plugin Status</td><td><span style='color: #00FF00;'>{plugin_status}</span></td></tr>"
-        html += f"<tr><td>Memory Status</td><td><span style='color: #00FF00;'>{memory_status}</span></td></tr>"
-        html += f"<tr><td>Conversation ID</td><td><span style='color: #00FF00;'>{convo_id}</span></td></tr>"
-        html += f"<tr><td>Session Timer Remaining</td><td><span style='color: #00FF00;'>{sec_rem}</span></td></tr>"
-        html += f"<tr><td>Wake Count</td><td><span style='color: #00FF00;'>{wake_count}</span></td></tr>"
-        html += f"<tr><td>Commands Processed</td><td><span style='color: #00FF00;'>{cmds_proc}</span></td></tr>"
-        html += f"<tr><td>Responses Spoken</td><td><span style='color: #00FF00;'>{resp_spk}</span></td></tr>"
-        html += f"<tr><td>Average Recognition Time</td><td><span style='color: #00FF00;'>{avg_rec_lat}</span></td></tr>"
-        html += f"<tr><td>Average AI Time</td><td><span style='color: #00FF00;'>{avg_ai_time}</span></td></tr>"
-        html += f"<tr><td>Average Response Time</td><td><span style='color: #00FF00;'>{avg_res_lat}</span></td></tr>"
-        html += f"<tr><td>Memory Usage</td><td><span style='color: #00FF00;'>{ram_usage}</span></td></tr>"
-        html += f"<tr><td>CPU Usage</td><td><span style='color: #00FF00;'>{cpu_usage}</span></td></tr>"
-        html += f"<tr><td>Registered Services</td><td><span style='color: #00FF00;'>{services_list}</span></td></tr>"
-        html += f"<tr><td>Application Version</td><td><span style='color: #00FF00;'>{app_version}</span></td></tr>"
-        html += "</table>"
-        
-        active_rec = engine_srv.active_recognizer if engine_srv else None
-        rec_thread_alive = "Yes" if (active_rec and active_rec.thread and active_rec.thread.is_alive()) else "No"
-        rec_loop_running = "Yes" if (active_rec and active_rec.active) else "No"
-        mic_open = "Yes" if (active_rec and active_rec.active) else "No"
-        stream_active = "Yes" if (active_rec and active_rec.active) else "No"
-        cb_count = getattr(active_rec, "audio_callback_count", getattr(active_rec, "chunks_received", 0)) if active_rec else 0
-        rec_count = event_bus.get_publish_count("SPEECH_RECOGNIZED")
-        speech_events_pub = event_bus.get_publish_count("SPEECH_RECOGNIZED")
-        wake_events_pub = event_bus.get_publish_count("WAKE_DETECTED")
-        commands_exec = event_bus.get_publish_count("COMMAND_RECEIVED")
-        dropped_buffers = getattr(active_rec, "dropped_buffers", 0) if active_rec else 0
- 
-        html += "<br/><b>Voice Recognition Forensics:</b><br/>"
-        html += "<table width='100%' cellpadding='4' style='color: #A0A0A0; font-family: monospace; border-bottom: 1px solid rgba(255,255,255,0.06);'>"
-        html += f"<tr><td>Recognition Thread Alive</td><td><span style='color: #00FF00;'>{rec_thread_alive}</span></td></tr>"
-        html += f"<tr><td>Recognition Loop Running</td><td><span style='color: #00FF00;'>{rec_loop_running}</span></td></tr>"
-        html += f"<tr><td>Microphone Open</td><td><span style='color: #00FF00;'>{mic_open}</span></td></tr>"
-        html += f"<tr><td>Audio Stream Active</td><td><span style='color: #00FF00;'>{stream_active}</span></td></tr>"
-        html += f"<tr><td>Audio Callback Count</td><td><span style='color: #00FF00;'>{cb_count}</span></td></tr>"
-        html += f"<tr><td>Recognition Count</td><td><span style='color: #00FF00;'>{rec_count}</span></td></tr>"
-        html += f"<tr><td>Speech Events Published</td><td><span style='color: #00FF00;'>{speech_events_pub}</span></td></tr>"
-        html += f"<tr><td>Wake Events Published</td><td><span style='color: #00FF00;'>{wake_events_pub}</span></td></tr>"
-        html += f"<tr><td>Commands Executed</td><td><span style='color: #00FF00;'>{commands_exec}</span></td></tr>"
-        html += f"<tr><td>Dropped Buffers</td><td><span style='color: #00FF00;'>{dropped_buffers}</span></td></tr>"
-        html += f"<tr><td>Current Voice State</td><td><span style='color: #00FF00;'>{voice_state}</span></td></tr>"
-        html += "</table>"
-        
-        html += "<br/><b>Task History:</b><br/>"
-        tasks = task_manager.list_tasks()[-5:]
-        for t in reversed(tasks):
-            color = "#00FF00" if t["status"] == "Completed" else "#C1121F" if t["status"] == "Failed" else "orange"
-            html += f"Task: <b>{t['description'][:30]}</b> | Status: <b style='color: {color};'>{t['status'].upper()}</b><br/>"
-            
-        self.tools_view.setHtml(html)
+        snapshot = {
+            "queue_count":          self.queue_count,
+            "current_voice_state": self.current_voice_state,
+            "timer_active":        timer_active,
+            "sec_rem":             f"{rem_ms / 1000.0:.1f} s" if rem_ms >= 0 else "-",
+            "devices":             devices,
+            "mic_allowed":         mic_allowed,
+            "speaker_allowed":     speaker_allowed,
+            "camera_allowed":      camera_allowed,
+        }
+        self._diag_worker = _DiagnosticsWorker(self.core, snapshot)
+        self._diag_worker.html_ready.connect(self._on_diag_html_ready, Qt.ConnectionType.QueuedConnection)
+        self._diag_worker.finished.connect(self._diag_worker.deleteLater)
+        self._diag_worker.start()
+
+    @Slot(str)
+    def _on_diag_html_ready(self, html: str):
+        """Receives diagnostic HTML from the worker and updates the display widget on main thread."""
+        if hasattr(self, "tools_view") and self.tools_view:
+            self.tools_view.setHtml(html)
+
+
 
     def on_vosk_model_missing(self, event):
         from PySide6.QtCore import QMetaObject, Qt
@@ -2307,7 +2720,9 @@ class UltronMainWindow(QMainWindow):
             self.refresh_memory_view()
         elif index == 2:
             self.refresh_projects_view()
-        elif index == 5: # SETTINGS
+        elif index == 5:
+            self.refresh_hidden_items_view()
+        elif index == 6: # SETTINGS
             self.refresh_settings_view()
 
     def refresh_memory_view(self):
@@ -2490,17 +2905,40 @@ class UltronMainWindow(QMainWindow):
         self.lbl_op_voice_val.setText("Enabled" if profile.get("voice_enabled", True) else "Disabled")
         self.lbl_op_work_val.setText(profile.get("workspace_directory", "-"))
 
-    # ── Window Draggability ──
+    # ── Window Draggability & Keyboard Shortcuts ──
 
     def mousePressEvent(self, event):
+        if self.isFullScreen():
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
+        if self.isFullScreen():
+            return
         if event.buttons() == Qt.MouseButton.LeftButton and self._drag_position is not None:
             self.move(event.globalPosition().toPoint() - self._drag_position)
             event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_F11:
+            self.toggle_fullscreen()
+            event.accept()
+        elif event.key() == Qt.Key.Key_Escape:
+            if self.isFullScreen():
+                self.toggle_fullscreen()
+                event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.core.logger.info("SYSTEM", "Fullscreen mode deactivated.")
+        else:
+            self.showFullScreen()
+            self.core.logger.info("SYSTEM", "Fullscreen mode activated.")
 
     def load_user_profile(self):
         try:
@@ -2594,19 +3032,13 @@ class UltronMainWindow(QMainWindow):
     @Slot(object)
     def on_ai_response_ready(self, event):
         response = event.payload.get("response", "")
-        def update_ui():
-            self.append_ai_message(response)
-            self.refresh_projects_view()
-            self.refresh_memory_view()
-            active_proj = self.core.session.active_project
-            if active_proj:
-                self.project_panel.p_name.setText(active_proj)
-                self.project_panel.p_desc.setText("Active Workspace")
-        
-        if threading.current_thread().name == "MainThread":
-            update_ui()
-        else:
-            QTimer.singleShot(0, update_ui)
+        self.append_ai_message(response)
+        self.refresh_projects_view()
+        self.refresh_memory_view()
+        active_proj = self.core.session.active_project
+        if active_proj:
+            self.project_panel.p_name.setText(active_proj)
+            self.project_panel.p_desc.setText("Active Workspace")
 
     def _escape_html(self, text):
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
@@ -2627,22 +3059,240 @@ class UltronMainWindow(QMainWindow):
         self.dev_console.toggle_console()
         self.core.logger.info("SYSTEM", f"Developer Console toggled. Visible: {self.dev_console.isVisible()}")
 
+    def create_hidden_items_page(self) -> QWidget:
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
+        
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        title_lbl = QLabel("HIDDEN ITEMS VAULT")
+        title_lbl.setFont(QFont("Inter", 14, QFont.Weight.Bold))
+        title_lbl.setStyleSheet("color: #C1121F;")
+        layout.addWidget(title_lbl)
+        
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(10)
+        
+        self.vault_search_input = QLineEdit()
+        self.vault_search_input.setPlaceholderText("Search hidden items by name or path...")
+        self.vault_search_input.setStyleSheet(
+            "QLineEdit { background-color: rgba(17, 17, 17, 0.7); border: 1px solid rgba(255, 255, 255, 0.05); "
+            "border-radius: 6px; padding: 6px 12px; color: #F5F5F5; } QLineEdit:focus { border: 1px solid #E63946; }"
+        )
+        self.vault_search_input.textChanged.connect(self.filter_hidden_items)
+        search_layout.addWidget(self.vault_search_input)
+        
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(255, 255, 255, 0.05); color: #F5F5F5; "
+            "border: 1px solid rgba(255, 255, 255, 0.05); padding: 6px 15px; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #C1121F; border: 1px solid #E63946; color: white; }"
+        )
+        refresh_btn.clicked.connect(self.refresh_hidden_items_view)
+        search_layout.addWidget(refresh_btn)
+        
+        layout.addLayout(search_layout)
+        
+        self.vault_table = QTableWidget()
+        self.vault_table.setColumnCount(5)
+        self.vault_table.setHorizontalHeaderLabels(["Name", "Path", "Status", "Date Hidden", "Actions"])
+        self.vault_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.vault_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.vault_table.setShowGrid(True)
+        self.vault_table.setFont(QFont("Inter", 10))
+        
+        self.vault_table.setStyleSheet("""
+            QTableWidget {
+                background-color: rgba(17, 17, 17, 0.4);
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                border-radius: 8px;
+                color: #F5F5F5;
+                gridline-color: rgba(255, 255, 255, 0.05);
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+            }
+            QTableWidget::item:selected {
+                background-color: rgba(193, 18, 31, 0.2);
+                color: #FFFFFF;
+            }
+            QHeaderView::section {
+                background-color: rgba(0, 0, 0, 0.3);
+                color: #A0A0A0;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+        """)
+        
+        header = self.vault_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        
+        self.vault_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.vault_table)
+        
+        return widget
+
+    def refresh_hidden_items_view(self):
+        if not hasattr(self, "vault_table"):
+            return
+            
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHBoxLayout, QPushButton, QWidget
+        from ultron.core.service_manager import service_manager
+        from datetime import datetime
+        
+        vault_srv = service_manager.get_service("HiddenItemsService")
+        if not vault_srv:
+            return
+            
+        items = vault_srv.list_hidden_items()
+        items.sort(key=lambda x: x.get("hidden_timestamp", ""), reverse=True)
+        
+        self.vault_table.setRowCount(len(items))
+        
+        for idx, item in enumerate(items):
+            name_item = QTableWidgetItem(item["name"])
+            name_item.setForeground(QColor("#F5F5F5"))
+            self.vault_table.setItem(idx, 0, name_item)
+            
+            path_item = QTableWidgetItem(item["original_path"])
+            path_item.setForeground(QColor("#A0A0A0"))
+            self.vault_table.setItem(idx, 1, path_item)
+            
+            status = item["status"]
+            status_item = QTableWidgetItem(status.upper())
+            if status == "hidden":
+                status_item.setForeground(QColor("#E63946"))
+            elif status == "restored":
+                status_item.setForeground(QColor("#00FF00"))
+            else:
+                status_item.setForeground(QColor("#FFA500"))
+            self.vault_table.setItem(idx, 2, status_item)
+            
+            ts = item["hidden_timestamp"]
+            try:
+                dt = datetime.fromisoformat(ts)
+                ts_display = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_display = ts
+            date_item = QTableWidgetItem(ts_display)
+            date_item.setForeground(QColor("#A0A0A0"))
+            self.vault_table.setItem(idx, 3, date_item)
+            
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(4, 2, 4, 2)
+            action_layout.setSpacing(6)
+            
+            restore_btn = QPushButton("Restore")
+            restore_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(0, 255, 0, 0.1); color: #00FF00; "
+                "border: 1px solid rgba(0, 255, 0, 0.2); border-radius: 4px; padding: 2px 8px; font-size: 11px; }"
+                "QPushButton:hover { background-color: rgba(0, 255, 0, 0.3); }"
+            )
+            restore_btn.clicked.connect(lambda checked=False, p=item["original_path"]: self.vault_restore_action(p))
+            
+            open_btn = QPushButton("Open")
+            open_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(255, 255, 255, 0.05); color: #F5F5F5; "
+                "border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 2px 8px; font-size: 11px; }"
+                "QPushButton:hover { background-color: rgba(255, 255, 255, 0.15); }"
+            )
+            open_btn.clicked.connect(lambda checked=False, n=item["name"]: self.vault_open_action(n))
+            
+            delete_btn = QPushButton("Delete")
+            delete_btn.setStyleSheet(
+                "QPushButton { background-color: rgba(193, 18, 31, 0.1); color: #C1121F; "
+                "border: 1px solid rgba(193, 18, 31, 0.2); border-radius: 4px; padding: 2px 8px; font-size: 11px; }"
+                "QPushButton:hover { background-color: rgba(193, 18, 31, 0.3); }"
+            )
+            delete_btn.clicked.connect(lambda checked=False, i=item["id"]: self.vault_delete_action(i))
+            
+            if status == "missing":
+                restore_btn.setEnabled(False)
+                open_btn.setEnabled(False)
+            elif status == "restored":
+                restore_btn.setEnabled(False)
+                
+            action_layout.addWidget(restore_btn)
+            action_layout.addWidget(open_btn)
+            action_layout.addWidget(delete_btn)
+            
+            self.vault_table.setCellWidget(idx, 4, action_widget)
+
+    def filter_hidden_items(self, text):
+        if not hasattr(self, "vault_table"):
+            return
+        query = text.lower().strip()
+        for row in range(self.vault_table.rowCount()):
+            name = self.vault_table.item(row, 0).text().lower()
+            path = self.vault_table.item(row, 1).text().lower()
+            match = (query in name) or (query in path)
+            self.vault_table.setRowHidden(row, not match)
+
+    def vault_restore_action(self, path):
+        from ultron.core.service_manager import service_manager
+        vault_srv = service_manager.get_service("HiddenItemsService")
+        if vault_srv:
+            try:
+                name = vault_srv.unhide_item(path)
+                self.append_ai_message(f"Vault: {name} has been restored and is visible again.")
+                self.refresh_hidden_items_view()
+            except Exception as e:
+                self.append_ai_message(f"Vault Error restoring item: {e}")
+                
+    def vault_open_action(self, name):
+        from ultron.core.service_manager import service_manager
+        vault_srv = service_manager.get_service("HiddenItemsService")
+        if vault_srv:
+            try:
+                vault_srv.open_hidden_item(name)
+                self.append_ai_message(f"Vault: Opening hidden item '{name}' temporarily. It will be re-secured shortly.")
+                self.refresh_hidden_items_view()
+            except Exception as e:
+                self.append_ai_message(f"Vault Error opening item: {e}")
+                
+    def vault_delete_action(self, item_id):
+        from ultron.core.service_manager import service_manager
+        vault_srv = service_manager.get_service("HiddenItemsService")
+        if vault_srv:
+            try:
+                vault_srv.delete_record(item_id)
+                self.refresh_hidden_items_view()
+            except Exception as e:
+                self.append_ai_message(f"Vault Error deleting record: {e}")
+
     def close_gracefully(self):
         self.core.logger.info("SYSTEM", "Initiating shutdown protocol.")
         
         try:
-            event_bus.unsubscribe("STATE_CHANGED", self.on_state_changed)
-            event_bus.unsubscribe("VOICE_STATE_CHANGED", self.on_voice_state_changed)
-            event_bus.unsubscribe("QUEUE_COUNT_CHANGED", self.on_queue_count_changed)
-            event_bus.unsubscribe("WAKE_TRIGGERED", self.on_wake_triggered)
-            event_bus.unsubscribe("SLEEP_TRIGGERED", self.on_sleep_triggered)
-            event_bus.unsubscribe("VOICE_DIAGNOSTICS_UPDATE", self.on_voice_diagnostics_update)
-            event_bus.unsubscribe("NOTIFICATION", self.on_notification_event)
-            event_bus.unsubscribe("WARNING_OCCURRED", self.on_warning_event)
-            event_bus.unsubscribe("ERROR_OCCURRED", self.on_error_event)
-            event_bus.unsubscribe("VOSK_MODEL_MISSING", self.on_vosk_model_missing)
-            event_bus.unsubscribe("VOLUME_LEVEL_CHANGED", self.on_volume_level_changed)
-            event_bus.unsubscribe("AI_RESPONSE_READY", self.on_ai_response_ready)
+            if hasattr(self, "diag_timer") and self.diag_timer:
+                self.diag_timer.stop()
+            if hasattr(self, "_diag_worker") and self._diag_worker and self._diag_worker.isRunning():
+                self._diag_worker.quit()
+                self._diag_worker.wait(1000)
+            if hasattr(self, "perf_dashboard") and self.perf_dashboard:
+                if hasattr(self.perf_dashboard, "timer") and self.perf_dashboard.timer:
+                    self.perf_dashboard.timer.stop()
+                self.perf_dashboard.stop_worker()
+        except Exception:
+            pass
+
+        try:
+            for et in [
+                "STATE_CHANGED", "VOICE_STATE_CHANGED", "QUEUE_COUNT_CHANGED",
+                "WAKE_TRIGGERED", "SLEEP_TRIGGERED", "VOICE_DIAGNOSTICS_UPDATE",
+                "NOTIFICATION", "WARNING_OCCURRED", "ERROR_OCCURRED",
+                "VOSK_MODEL_MISSING", "VOLUME_LEVEL_CHANGED", "AI_RESPONSE_READY"
+            ]:
+                event_bus.unsubscribe(et, self._event_bus_route_callback)
         except Exception:
             pass
             

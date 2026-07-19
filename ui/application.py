@@ -59,7 +59,7 @@ class ServiceStartupThread(QThread):
             dur = (time.time() - t0) * 1000
             self.service_timed.emit(name, dur)
             level = "WARNING" if dur > 100 else "INFO"
-            msg = f"[ServiceStartupThread] {name}: {dur:.0f} ms{' ← SLOW (>100ms)' if dur > 100 else ''}"
+            msg = f"[ServiceStartupThread] {name}: {dur:.0f} ms{' <- SLOW (>100ms)' if dur > 100 else ''}"
             getattr(logger, level.lower())(msg)
             print(f"[BOOT] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}")
 

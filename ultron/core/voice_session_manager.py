@@ -54,6 +54,7 @@ class UltronVoiceSessionManager(UltronService):
         self.recognition_latencies = []
         self.response_latencies = []
         self.ai_durations = []
+        self.pending_confirmation = None
         
         # Thread-safe Qt signal bridge
         self.signals = VoiceSessionManagerSignals()

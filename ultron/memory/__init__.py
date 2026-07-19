@@ -38,6 +38,8 @@ class MemoryManager:
             "voice_history": SqliteMemoryStore(db_path, "voice_history_memory", "voice_history"),
             "wake_history": SqliteMemoryStore(db_path, "wake_history_memory", "wake_history"),
             "diagnostics": SqliteMemoryStore(db_path, "diagnostics_memory", "diagnostics"),
+            "app_cache": SqliteMemoryStore(db_path, "app_cache_memory", "app_cache"),
+            "learning": SqliteMemoryStore(db_path, "learning_memory", "learning"),
             "working": WorkingMemoryStore()
         }
         
@@ -57,6 +59,8 @@ class MemoryManager:
             "voice_history": LifecyclePolicy(archive_after_inactivity=False, persistent=True),
             "wake_history": LifecyclePolicy(archive_after_inactivity=False, persistent=True),
             "diagnostics": LifecyclePolicy(archive_after_inactivity=False, persistent=True),
+            "app_cache": LifecyclePolicy(archive_after_inactivity=False, persistent=True),
+            "learning": LifecyclePolicy(archive_after_inactivity=False, persistent=True),
             "working": LifecyclePolicy(archive_after_inactivity=False, persistent=False)
         }
 

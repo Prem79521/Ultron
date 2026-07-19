@@ -48,9 +48,11 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
 
         def _cp(n, msg):
             """Checkpoint: always prints immediately regardless of log level."""
+            import sys
             ts = time.strftime('%H:%M:%S') + f".{int((time.time() % 1) * 1000):03d}"
             line = f"[VOSK CP{n:02d}] [{ts}] {msg}"
-            print(line, flush=True)
+            enc = sys.stdout.encoding or 'utf-8'
+            print(line.encode(enc, errors='replace').decode(enc), flush=True)
             self.logger.info(line)
 
         _cp(1, "_initialize_vosk() entered")
@@ -205,6 +207,22 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
             time.sleep(0.2)
             self.start()
 
+    def flush_audio_queue(self):
+        """Safely flushes any pending audio chunks in the queue and resets Kaldi state."""
+        count = 0
+        try:
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+                count += 1
+        except queue.Empty:
+            pass
+        if self.rec:
+            try:
+                self.rec.Reset()
+            except Exception:
+                pass
+        self.logger.info(f"Audio queue flushed ({count} frames removed)")
+
     def start(self) -> bool:
         if self.active:
             return True
@@ -316,9 +334,11 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
         from ultron.voice.pipeline_tracker import trace_pipeline, pipeline_broken
 
         def _cp(n, msg):
+            import sys
             ts = time.strftime('%H:%M:%S') + f".{int((time.time() % 1) * 1000):03d}"
             line = f"[VOSK CP{n:02d}] [{ts}] [thread={threading.current_thread().name}] {msg}"
-            print(line, flush=True)
+            enc = sys.stdout.encoding or 'utf-8'
+            print(line.encode(enc, errors='replace').decode(enc), flush=True)
             self.logger.info(line)
 
         _cp(10, "_run() entered — recognition thread is alive")
@@ -352,8 +372,8 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
         _v_ready      = _v_model and _v_recognizer and _v_thread
 
         def _print_verification(audio_cb_active: bool):
-            _pass = "\u2713 PASS"
-            _fail = "\u2717 FAIL"
+            _pass = "[PASS]"
+            _fail = "[FAIL]"
             lines = [
                 f"  Model Loaded          {_pass if _v_model else _fail}",
                 f"  Recognizer Created    {_pass if _v_recognizer else _fail}",
@@ -366,8 +386,12 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
             if all_ok:
                 banner += "\n\nRecognition ACTIVE"
             else:
-                banner += "\n\nRecognition NOT READY — check above failures"
-            print(banner, flush=True)
+                banner += "\n\nRecognition NOT READY - check above failures"
+            # Safe print: encode to stdout's charset, replacing unencodable chars
+            try:
+                print(banner, flush=True)
+            except UnicodeEncodeError:
+                print(banner.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8"), flush=True)
             self.logger.info(banner)
             if all_ok:
                 event_bus.publish("RECOGNITION_ACTIVE", {"model": self.model_name})
@@ -450,6 +474,15 @@ class VoskVoiceRecognitionProvider(VoiceRecognitionProvider):
             if status:
                 self.logger.warning(f"Vosk audio stream status: {status}")
                 pipeline_broken("Microphone", f"sounddevice status warning: {status}")
+
+            try:
+                from ultron.core.service_manager import service_manager
+                reco_service = service_manager.get_service("VoiceRecognitionService")
+                if reco_service and not reco_service.is_recognition_enabled():
+                    self.logger.debug("Dropped microphone frame during TTS")
+                    return
+            except Exception:
+                pass
 
             self.audio_queue.put(bytes(indata))
             self.audio_callback_count += 1

@@ -20,6 +20,7 @@ class EventBus:
         self._sticky_events: Dict[str, Event] = {}
         self._event_history: List[Dict[str, Any]] = []
         self._publish_counts: Dict[str, int] = {}
+        self._publish_timestamps: List[float] = []
         self._lock = threading.RLock()
         self.logger = logging.getLogger("ultron-agent")
 
@@ -69,35 +70,21 @@ class EventBus:
     def publish(self, event_type: str, payload: Any = None, sticky: bool = False, delay: float = 0.0):
         """Publishes an event to the bus. Supports delays and sticky states."""
         event = Event(event_type, payload)
-        
+
+        # Single lock acquisition for all bookkeeping
         with self._lock:
             self._publish_counts[event_type] = self._publish_counts.get(event_type, 0) + 1
-            
-        if sticky:
-            with self._lock:
+            now = time.time()
+            self._publish_timestamps.append(now)
+            # Trim timestamps older than 1 second
+            while self._publish_timestamps and self._publish_timestamps[0] < now - 1.0:
+                self._publish_timestamps.pop(0)
+            if sticky:
                 self._sticky_events[event_type] = event
-                
-        # Record to history
-        with self._lock:
-            self._event_history.append({
-                "event_type": event_type,
-                "payload": payload,
-                "timestamp": event.timestamp
-            })
+            # Bounded history ring-buffer
+            self._event_history.append({"event_type": event_type, "payload": payload, "timestamp": event.timestamp})
             if len(self._event_history) > 100:
                 self._event_history.pop(0)
-
-        # Phase 4 EventBus Audit
-        if event_type in ["SPEECH_RECOGNIZED", "WAKE_DETECTED", "VOICE_STATE_CHANGED", "COMMAND_RECEIVED"]:
-            with self._lock:
-                sub_count = len(self._subscribers.get(event_type, []))
-            self.logger.info(
-                f"EVENT PUBLISHED\n"
-                f"Name: {event_type}\n"
-                f"Subscribers: {sub_count}\n"
-                f"Thread: {threading.current_thread().name}\n"
-                f"Timestamp: {event.timestamp}"
-            )
 
         if delay > 0.0:
             timer = threading.Timer(delay, self._dispatch, args=[event])
@@ -111,50 +98,27 @@ class EventBus:
         with self._lock:
             return self._publish_counts.get(event_type, 0)
 
+    def get_events_per_second(self) -> int:
+        """Returns the total number of events published in the last 1 second."""
+        with self._lock:
+            now = time.time()
+            while self._publish_timestamps and self._publish_timestamps[0] < now - 1.0:
+                self._publish_timestamps.pop(0)
+            return len(self._publish_timestamps)
+
     def _dispatch(self, event: Event):
         with self._lock:
             listeners = list(self._subscribers.get(event.event_type, []))
-            
-        delivered_to = []
-        for cb, _ in listeners:
-            if hasattr(cb, "__self__"):
-                name = cb.__self__.__class__.__name__
-                if "MainWindow" in name:
-                    name = "MainWindow"
-                delivered_to.append(name)
-            elif hasattr(cb, "__name__"):
-                delivered_to.append(cb.__name__)
-            else:
-                delivered_to.append(str(cb))
 
-        if event.event_type in ["WAKE_DETECTED", "VOICE_STATE_CHANGED", "COMMAND_RECEIVED", "COMMAND_COMPLETED", "VoiceStarted", "VoiceStopped"]:
-            import inspect
-            import os
-            caller_name = "Unknown"
-            try:
-                frame = inspect.currentframe().f_back
-                while frame and ("event_bus" in frame.f_code.co_filename or "publish" in frame.f_code.co_name):
-                    frame = frame.f_back
-                if frame:
-                    self_obj = frame.f_locals.get("self", None)
-                    if self_obj:
-                        caller_name = self_obj.__class__.__name__
-                    else:
-                        caller_name = os.path.basename(frame.f_code.co_filename)
-                        if caller_name.endswith(".py"):
-                            caller_name = caller_name[:-3]
-            except Exception:
-                pass
-                
-            subs_count = len(listeners)
-            delivered_str = ", ".join(delivered_to) if delivered_to else "None"
-            self.logger.info(
-                f"\nPublished:\n{event.event_type}\n"
-                f"Publisher:\n{caller_name}\n"
-                f"Subscribers:\n{subs_count}\n"
-                f"Delivered:\n{delivered_str}\n"
+        # Debug-only audit trace (guarded — zero cost in production INFO level)
+        if self.logger.isEnabledFor(logging.DEBUG) and event.event_type in (
+            "WAKE_DETECTED", "VOICE_STATE_CHANGED", "COMMAND_RECEIVED",
+            "COMMAND_COMPLETED", "VoiceStarted", "VoiceStopped",
+        ):
+            self.logger.debug(
+                "EventBus dispatch: %s -> %d listener(s)", event.event_type, len(listeners)
             )
-            
+
         for callback, _ in listeners:
             try:
                 callback(event)
@@ -172,6 +136,11 @@ class EventBus:
         for item in history:
             event = Event(item["event_type"], item["payload"])
             self._dispatch(event)
+
+    def get_subscriber_count(self) -> int:
+        """Returns total number of registered subscriber callbacks across all event types."""
+        with self._lock:
+            return sum(len(subs) for subs in self._subscribers.values())
 
     def get_history(self) -> List[Dict[str, Any]]:
         with self._lock:

@@ -14,10 +14,15 @@ class RecognitionService(UltronService):
         self.callback = callback_func
         self.logger = logging.getLogger("ultron-agent")
         self.engine_service = None
+        self._recognition_enabled = True
 
     def start(self) -> bool:
         self.active = True
         self.logger.info("Starting Recognition Service...")
+        
+        # Subscribe to TTS events for pausing/resuming recognition
+        event_bus.subscribe("VoiceStarted", self._on_voice_started)
+        event_bus.subscribe("VoiceStopped", self._on_voice_stopped)
         
         # Resolve engine service dynamically
         from ultron.core.service_manager import service_manager
@@ -31,9 +36,35 @@ class RecognitionService(UltronService):
 
     def stop(self) -> bool:
         self.active = False
+        try:
+            event_bus.unsubscribe("VoiceStarted", self._on_voice_started)
+            event_bus.unsubscribe("VoiceStopped", self._on_voice_stopped)
+        except Exception:
+            pass
         if self.engine_service and self.engine_service.active_recognizer:
             self.engine_service.active_recognizer.stop()
         return True
+
+    def pause_recognition(self):
+        self._recognition_enabled = False
+        self.logger.info("Recognition paused")
+
+    def resume_recognition(self):
+        # Flush buffered audio before enabling recognition
+        if self.engine_service and self.engine_service.active_recognizer:
+            if hasattr(self.engine_service.active_recognizer, "flush_audio_queue"):
+                self.engine_service.active_recognizer.flush_audio_queue()
+        self._recognition_enabled = True
+        self.logger.info("Recognition resumed")
+
+    def is_recognition_enabled(self) -> bool:
+        return self._recognition_enabled
+
+    def _on_voice_started(self, event):
+        self.pause_recognition()
+
+    def _on_voice_stopped(self, event):
+        self.resume_recognition()
 
     def health(self) -> str:
         if not self.active:
@@ -46,6 +77,10 @@ class RecognitionService(UltronService):
         import threading, datetime
         print(f"[PIPELINE] [{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [thread={threading.current_thread().name}] HOP1: _handle_speech fired | obj={id(self)} | text='{text}'")
         if not self.active:
+            return
+            
+        if not self._recognition_enabled:
+            self.logger.info(f"Dropped recognition result while paused: '{text}'")
             return
             
         provider_name = "SAPI"

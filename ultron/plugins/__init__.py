@@ -2,7 +2,7 @@
 ULTRON Plugins Module — Decoupled interface for third-party integrations (GitHub, Discord, Spotify).
 """
 
-from typing import List
+from typing import List, Any
 
 class PluginBase:
     def __init__(self, core_system):

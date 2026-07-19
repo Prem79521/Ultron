@@ -65,7 +65,7 @@ class SkillRegistry:
 
     def health(self) -> dict:
         loaded_skills = list(self._skills.keys())
-        is_healthy = len(loaded_skills) >= 5  # Expect 5 native skills
+        is_healthy = len(loaded_skills) >= 10  # Expect 10 native skills (5 legacy + 5 new)
         return {
             "status": "healthy" if is_healthy else "degraded",
             "details": f"Registered skills ({len(loaded_skills)}): {', '.join(loaded_skills)}"
@@ -78,9 +78,23 @@ def register_all_skills(registry: SkillRegistry):
     from ultron.skills.terminal import TerminalSkill
     from ultron.skills.browser import BrowserSkill
     from ultron.skills.command_dispatcher import CommandDispatcher
+    
+    # New Phase 1 OS skills
+    from ultron.skills.browser_skill import BrowserSkill as NewBrowserSkill
+    from ultron.skills.website_skill import WebsiteSkill
+    from ultron.skills.search_skill import SearchSkill
+    from ultron.skills.application_skill import ApplicationSkill
+    from ultron.skills.windows_skill import WindowsSkill
 
     registry.register_skill("ProjectManager", ProjectManagerSkill)
     registry.register_skill("FileSystem", FileSystemSkill)
     registry.register_skill("Terminal", TerminalSkill)
     registry.register_skill("Browser", BrowserSkill)
     registry.register_skill("CommandDispatcher", CommandDispatcher)
+    
+    # Register new Phase 1 OS skills
+    registry.register_skill("BrowserSkill", NewBrowserSkill)
+    registry.register_skill("WebsiteSkill", WebsiteSkill)
+    registry.register_skill("SearchSkill", SearchSkill)
+    registry.register_skill("ApplicationSkill", ApplicationSkill)
+    registry.register_skill("WindowsSkill", WindowsSkill)

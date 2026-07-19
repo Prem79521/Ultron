@@ -345,19 +345,33 @@ def complete_boot_from_ui(main_window, memory, voice, skills):
     try:
         from ultron.vision.camera_manager import CameraService
         from ultron.vision.vision_provider import VisionService
+        from ultron.vision.gesture_service import GestureService
+        from ultron.core.graphics_service import GraphicsService
         from ultron.llm.llm_manager import LlmService
         
         camera_srv = CameraService()
         vision_srv = VisionService()
+        gesture_srv = GestureService()
+        graphics_srv = GraphicsService()
         llm_srv = LlmService()
         
         service_manager.register_service("CameraService", camera_srv)
         service_manager.register_service("VisionService", vision_srv)
+        service_manager.register_service("GestureService", gesture_srv)
+        service_manager.register_service("GraphicsService", graphics_srv)
         service_manager.register_service("LlmService", llm_srv)
         
         from ultron.core.notification_center import notification_center
         service_manager.register_service("NotificationService", notification_center)
         service_manager.register_service("HealthMonitorService", health_monitor)
+        
+        # Register HiddenItemsService
+        try:
+            from ultron.services.hidden_items_service import HiddenItemsService
+            vault_srv = HiddenItemsService(db_path=memory.db_path)
+            service_manager.register_service("HiddenItemsService", vault_srv)
+        except Exception as e:
+            logger.error(f"Failed to register HiddenItemsService: {e}", exc_info=True)
         
         # Register first-class MCP Service
         try:

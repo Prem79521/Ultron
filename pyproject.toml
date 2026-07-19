@@ -5,11 +5,17 @@ description = "Ultron — A modular cognitive agent platform for developers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "comtypes>=1.4.16",
     "fastmcp",
     "httpx",
     "livekit-agents[deepgram,groq,openai,sarvam,silero]>=1.5.1",
     "livekit-plugins-google>=1.5.1",
+    "mediapipe>=0.10.35",
+    "opencv-python>=5.0.0.93",
+    "pyside6>=6.11.1",
     "python-dotenv",
+    "pyttsx3>=2.99",
+    "vosk>=0.3.45",
 ]
 
 [project.scripts]

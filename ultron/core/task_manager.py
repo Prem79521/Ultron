@@ -4,7 +4,7 @@ ULTRON Task Manager — Tracks active, queued, and completed Cognitive OS tasks.
 
 import time
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from ultron.core.event_bus import event_bus
 
 class UltronTask:
